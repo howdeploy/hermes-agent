@@ -1,8 +1,10 @@
 """Bot Mode agent-to-agent DM tool — ``message_agent``.
 
-A structured, Bot-Chat-only tool that lets a Bot Mode agent message a
-teammate agent (another Hermes profile on this install, or an agent on a
-registered peer gateway) WITHOUT hand-assembling shell commands.
+A structured Bot Mode tool that lets an agent message a teammate agent
+(another Hermes profile on this install, or an agent on a registered peer
+gateway) WITHOUT hand-assembling shell commands. Desktop exposes it in
+canonical ``Bot Chat`` sessions; interactive CLI and Telegram user sessions
+expose the same Bot Mode contract when at least one local teammate exists.
 
 Why this exists (Aug 2026): the Bot Mode teammate protocol taught agents to
 DM each other via a prompt-injected ``hermes -p <bot> chat ...`` shellout.
@@ -16,15 +18,16 @@ existing background-process notification path (fire-and-forget, never
 blocks the sender's turn).
 
 Containment contract (MUST hold — reviewers check all three):
-- The tool schema is injected ONLY into a bot's canonical "Bot Chat"
-  session on Bot-Mode-managed installs — the exact same gate as the
-  protocol section in ``tools/bot_mode_probe.py``. It is NOT registered in
-  the global tool registry, is NOT part of any toolset, and never appears
-  in CLI sessions, ordinary gateway chats, group-room member sessions
-  (titled "Group: …"), cron agents, or subagents.
-- Dispatch is title-gated again at execution time (defense in depth): a
-  forged call from a session that shouldn't have the tool returns a
-  structured error instead of delivering.
+- The tool schema is injected into a bot's canonical ``Bot Chat`` on a
+  Bot-Mode-managed install — the original Desktop gate — or into an
+  interactive CLI/Telegram user session with a callable Bot Mode teammate.
+  It is NOT registered in the global tool registry and is NOT part of any
+  toolset, so installs without bots pay no model-schema cost.
+- Internal ``Bot Chain``/group-room sessions, one-shot queries, cron agents,
+  subagents, and unsupported surfaces never receive it.
+- Dispatch repeats the same session-capability gate (defense in depth): a
+  forged call from any other session returns a structured error instead of
+  delivering.
 - Everything here is additive. The legacy protocol transports
   (``hermes -p`` / ``hermes peer dm``) keep working for older prompts.
 
@@ -57,6 +60,9 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 MESSAGE_AGENT_TOOL_NAME = "message_agent"
+
+_SESSION_KIND_BOT_CHAT = "bot_chat"
+_SESSION_KIND_USER = "user"
 
 # Message body cap — generous for real work products, small enough that a
 # runaway paste can't turn one DM into a context bomb on the recipient.
@@ -127,14 +133,11 @@ def message_agent_tool_schema() -> dict:
 
 
 def ensure_message_agent_tool(agent: Any) -> bool:
-    """Inject the ``message_agent`` schema into a Bot Chat agent's tool list.
+    """Inject ``message_agent`` into an eligible agent's stable tool list.
 
-    Called once per turn from the conversation loop. Idempotent and
-    deterministic for the life of a session: the gate (canonical Bot Chat
-    title on a Bot-Mode-managed install) is stable from the session's first
-    turn, so the tool list is byte-identical across turns — prompt-cache
-    safe. Every non-Bot-Chat session fails the gate on every turn and never
-    sees the schema. Never raises.
+    Called once per turn from the conversation loop. Idempotent. The decision
+    is memoized on the agent, so the list remains byte-identical for the life
+    of a session even if profiles change on disk mid-turn. Never raises.
     """
     try:
         if not getattr(agent, "_bot_mode_protocol", True):
@@ -147,15 +150,7 @@ def ensure_message_agent_tool(agent: Any) -> bool:
                     and tool.get("function", {}).get("name") == MESSAGE_AGENT_TOOL_NAME
                 ):
                     return True
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
-
-        if _session_title(agent) != BOT_CHAT_TITLE:
-            return False
-        # Managed-install check, NOT section non-emptiness: a profile whose
-        # SOUL.md carries the legacy plugin-appended protocol text gets an
-        # empty section (dedupe) but must still receive the tool — otherwise
-        # upgraded installs silently lose A2A messaging (Aug 2026).
-        if not is_bot_mode_managed(_agent_home(agent)):
+        if message_agent_session_kind(agent) is None:
             return False
         if agent.tools is None:
             agent.tools = []
@@ -195,6 +190,24 @@ def _local_roster(root: Path) -> list[str]:
                     names.append(child.name)
     except Exception:
         pass
+    return names
+
+
+def _enabled_local_roster(root: Path) -> list[str]:
+    """Bot Mode profiles callable from user-facing CLI/Telegram sessions."""
+    names = []
+    for name in _local_roster(root):
+        profile_dir = root if name == "default" else root / "profiles" / name
+        try:
+            from hermes_cli.profiles import read_profile_meta
+
+            if not read_profile_meta(profile_dir).get("bot_enabled", True):
+                continue
+        except Exception:
+            # Match the profile loader's fail-open metadata default. Delivery
+            # still validates that the resolved profile exists.
+            pass
+        names.append(name)
     return names
 
 
@@ -247,31 +260,29 @@ def message_agent_tool(
     """Deliver ``message`` to ``target``'s Bot Chat. Returns a JSON ack/error.
 
     ``agent`` is the calling AIAgent (threaded by the executor) — used for
-    the Bot Chat gate, the sender identity, and the session key so the
+    the Bot Mode session gate, the sender identity, and the session key so the
     spawned transport is tracked against the right session.
     """
-    # ── defense-in-depth gate: only a canonical Bot Chat may deliver ──
+    # ── defense-in-depth gate: only an advertised messaging session delivers ──
     home = _agent_home(agent)
     try:
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
-
-        title = _session_title(agent)
-        if title != BOT_CHAT_TITLE:
+        session_kind = message_agent_session_kind(agent)
+        if session_kind is None:
             return _err(
-                "message_agent is only available in a Bot Mode 'Bot Chat' session. "
-                "This session is not one; do not retry."
-            )
-        if not is_bot_mode_managed(home):
-            return _err(
-                "This install is not Bot-Mode-managed (no bot roster); "
-                "message_agent is unavailable. Do not retry."
+                "message_agent is not available in this session. Use an interactive "
+                "CLI or Telegram chat with configured bot teammates, or a Bot Mode "
+                "'Bot Chat'; do not retry from this session."
             )
     except Exception as exc:  # pragma: no cover — defensive
-        return _err(f"Bot Mode gate check failed: {exc}")
+        return _err(f"Agent messaging gate check failed: {exc}")
 
     root = _hermes_root(Path(home))
     me = _self_profile_name(Path(home))
-    roster = _local_roster(root)
+    roster = (
+        _enabled_local_roster(root)
+        if session_kind == _SESSION_KIND_USER
+        else _local_roster(root)
+    )
     peers = _peers(root)
     teammates = [_handle(n) for n in roster if n != me]
 
@@ -787,6 +798,101 @@ def _session_title(agent: Any) -> str:
     except Exception:
         pass
     return ""
+
+
+def _session_context_value(name: str) -> str:
+    try:
+        from gateway.session_context import get_session_env
+
+        return str(get_session_env(name, "") or "").strip()
+    except Exception:
+        return str(os.getenv(name, "") or "").strip()
+
+
+def _session_source(agent: Any) -> str:
+    source = _session_context_value("HERMES_SESSION_SOURCE")
+    if not source:
+        source = _session_context_value("HERMES_SESSION_PLATFORM")
+    if not source:
+        source = str(getattr(agent, "platform", "") or "").strip()
+    return (source or "cli").lower()
+
+
+def _is_interactive_user_session(agent: Any, source: str) -> bool:
+    if source == "cli":
+        return True
+    if source == "telegram":
+        # Main gateway conversations carry this stable routing key. Detached
+        # Telegram background tasks deliberately do not; they cannot route a
+        # later fire-and-forget reply back into the originating conversation.
+        return bool(str(getattr(agent, "_gateway_session_key", "") or "").strip())
+    return False
+
+
+def _is_internal_or_finite_session(agent: Any, title: str) -> bool:
+    from utils import is_truthy_value
+
+    if title.startswith("Bot Chain ") or title.startswith("Group: "):
+        return True
+    if is_truthy_value(_session_context_value("HERMES_SINGLE_QUERY_SESSION")):
+        return True
+    if is_truthy_value(_session_context_value("HERMES_CRON_SESSION")):
+        return True
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        if is_delegated_child_context():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _has_local_teammate(home: str) -> bool:
+    resolved = Path(home)
+    root = _hermes_root(resolved)
+    me = _self_profile_name(resolved)
+    return any(name != me for name in _enabled_local_roster(root))
+
+
+def message_agent_session_kind(agent: Any) -> Optional[str]:
+    """Return the stable Bot Mode messaging capability kind for ``agent``.
+
+    ``bot_chat`` preserves Desktop's canonical Bot Mode behavior. ``user`` is
+    the matching natural-language invocation surface for interactive CLI and
+    Telegram sessions. The first verdict is frozen on the agent to preserve
+    prompt/tool caching for the rest of that conversation.
+    """
+    cached = getattr(agent, "_message_agent_session_kind", None)
+    if cached is not None:
+        return cached or None
+
+    kind: Optional[str] = None
+    try:
+        if not getattr(agent, "_bot_mode_protocol", True):
+            kind = None
+        else:
+            from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
+
+            home = _agent_home(agent)
+            title = _session_title(agent)
+            if title == BOT_CHAT_TITLE and is_bot_mode_managed(home):
+                kind = _SESSION_KIND_BOT_CHAT
+            elif (
+                _is_interactive_user_session(agent, _session_source(agent))
+                and not _is_internal_or_finite_session(agent, title)
+                and _has_local_teammate(home)
+            ):
+                kind = _SESSION_KIND_USER
+    except Exception:
+        logger.debug("message_agent capability probe failed", exc_info=True)
+        kind = None
+
+    try:
+        agent._message_agent_session_kind = kind or ""
+    except Exception:
+        pass
+    return kind
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised as a background process

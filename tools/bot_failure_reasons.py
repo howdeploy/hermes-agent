@@ -7,17 +7,18 @@ agent-side codes are derived from raw agent/provider error text via
 ``classify_agent_error``.
 
 Classifier precedence (deterministic, documented, tested):
-    1. auth — an explicit ``authentication_error`` type, a 401/403 status,
+    1. session — ``SESSION_NOT_OWNED`` / an existing live owner.
+    2. auth — an explicit ``authentication_error`` type, a 401/403 status,
        or "invalid api key" wins over everything else. Rationale: real
        provider 401 bodies (e.g. Anthropic) say "invalid, blocked or out of
        funds" — quota words inside an auth error must not misclassify it.
-    2. quota   — 402 / out of funds / quota / balance.
-    3. rate    — 429 / rate limit.
-    4. server  — 5xx / server error / overloaded.
-    5. context — context length / context_overflow / maximum context.
-    6. config  — No LLM provider configured / missing config / No access token.
-    7. model   — model not found / does not exist.
-    8. unknown — anything else (including empty text).
+    3. quota   — 402 / out of funds / quota / balance.
+    4. rate    — 429 / rate limit.
+    5. server  — 5xx / server error / overloaded.
+    6. context — context length / context_overflow / maximum context.
+    7. config  — No LLM provider configured / missing config / No access token.
+    8. model   — model not found / does not exist.
+    9. unknown — anything else (including empty text).
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ QUEUED_EXPIRED = "queued_expired"
 DELIVERY_TIMEOUT = "delivery_timeout"
 AGENT_BLOCKED = "agent_blocked"
 CANCELLED = "cancelled"
+SESSION_BUSY = "session_busy"
 
 # ── agent-side reason codes ──────────────────────────────────────────────────
 PROVIDER_AUTH_OR_ACCESS = "provider_auth_or_access"
@@ -48,6 +50,7 @@ ALL_REASONS = frozenset(
         DELIVERY_TIMEOUT,
         AGENT_BLOCKED,
         CANCELLED,
+        SESSION_BUSY,
         PROVIDER_AUTH_OR_ACCESS,
         PROVIDER_QUOTA_LIMIT,
         PROVIDER_RATE_LIMIT,
@@ -107,6 +110,13 @@ def retry_action(reason: str) -> str:
 # Ordered (pattern, code) rules — first match wins. See module docstring for
 # the precedence rationale (auth beats quota by design).
 _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"SESSION_NOT_OWNED|already has a live owner",
+            re.IGNORECASE,
+        ),
+        SESSION_BUSY,
+    ),
     (
         re.compile(
             r"authentication_error|invalid api key"
@@ -170,3 +180,27 @@ def classify_agent_error(text: str) -> str:
         if pattern.search(raw):
             return code
     return UNKNOWN
+
+
+_MACHINE_REASON_ALIASES = {
+    "session_not_owned": SESSION_BUSY,
+    "rate_limit": PROVIDER_RATE_LIMIT,
+    "billing": PROVIDER_QUOTA_LIMIT,
+    "server_error": PROVIDER_SERVER_ERROR,
+    "model_not_found": MODEL_UNAVAILABLE,
+}
+
+
+def classify_session_error(machine_reason: object, text: str = "") -> str:
+    """Prefer a gateway's machine reason, then classify its display text.
+
+    Session RPC carries ``SESSION_NOT_OWNED`` in ``error.data.reason``.  This
+    helper keeps that stable field authoritative while retaining the legacy
+    text classifier for subprocess and older-runtime errors.
+    """
+    normalized = str(machine_reason or "").strip().lower()
+    if normalized in ALL_REASONS:
+        return normalized
+    if normalized in _MACHINE_REASON_ALIASES:
+        return _MACHINE_REASON_ALIASES[normalized]
+    return classify_agent_error(text)

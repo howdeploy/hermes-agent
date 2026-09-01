@@ -9370,9 +9370,11 @@ class AIAgent:
             # and background delivery processes sharing state.db (#84234).
             _turn_db = getattr(self, "_session_db", None)
             _durable_session_exists = False
+            _durable_session_row = None
             if _turn_db is not None and session_id:
                 try:
-                    _durable_session_exists = _turn_db.get_session(session_id) is not None
+                    _durable_session_row = _turn_db.get_session(session_id)
+                    _durable_session_exists = _durable_session_row is not None
                 except Exception:
                     # A locked / non-WAL read is not proof the row is absent.
                     # Treating probe failure as "fresh session" skipped the
@@ -9511,13 +9513,72 @@ class AIAgent:
                     )
 
                 # The holder may have compressed and rotated the session while
-                # this process waited. Resolve and reload only AFTER admission;
-                # a caller-provided in-memory snapshot is necessarily stale.
-                # Skip when acquisition was immediate — no other process held
-                # the lease, so the in-memory history is current and reloading
-                # would only cause an unnecessary prompt cache miss.
-                if _lease_waited:
-                    latest_session_id = _turn_db.resolve_resume_session_id(session_id)
+                # this process waited. A canonical Bot Chat can also receive a
+                # completed bot-chain turn while its Desktop runtime is idle:
+                # that writer releases the durable lease before the next user
+                # submit, so acquisition here is immediate even though the
+                # runtime's in-memory history is stale. Detect that narrow case
+                # by comparing the canonical row's active-message count with
+                # the durable markers carried by the live history.
+                _title_hint = str(
+                    getattr(self, "_session_title_hint", "") or ""
+                ).strip()
+                _row_title = str(
+                    (_durable_session_row or {}).get("title") or ""
+                ).strip()
+                _is_canonical_bot_chat = (
+                    _title_hint == "Bot Chat" or _row_title == "Bot Chat"
+                )
+                _memory_durable_count = sum(
+                    1
+                    for message in (conversation_history or [])
+                    if isinstance(message, dict)
+                    and message.get("_db_persisted")
+                )
+                _canonical_latest_session_id = None
+                _db_message_count = _memory_durable_count
+                if _is_canonical_bot_chat:
+                    try:
+                        if callable(
+                            getattr(type(_turn_db), "get_compression_tip", None)
+                        ):
+                            _canonical_latest_session_id = (
+                                _turn_db.get_compression_tip(session_id)
+                                or session_id
+                            )
+                        else:
+                            _canonical_latest_session_id = session_id
+                        # Re-read only AFTER lease admission. A chain publisher
+                        # can commit in the narrow probe→acquire window and
+                        # release before our first acquisition attempt; using
+                        # the earlier row would then miss a completed turn.
+                        _canonical_current_row = _turn_db.get_session(
+                            _canonical_latest_session_id
+                        )
+                        _db_message_count = int(
+                            (_canonical_current_row or {}).get("message_count")
+                            or 0
+                        )
+                    except Exception:
+                        # We own the lease but cannot prove the cached copy is
+                        # current. Reloading is the safe, read-only fallback.
+                        _db_message_count = _memory_durable_count + 1
+                _canonical_history_changed = (
+                    _is_canonical_bot_chat
+                    and _db_message_count != _memory_durable_count
+                )
+
+                # Resolve and reload only AFTER admission. Contention proves a
+                # caller snapshot stale; the count mismatch proves the same for
+                # externally published Bot Chat history. Matching immediate
+                # turns keep their in-memory objects and prompt-cache prefix.
+                if _lease_waited or _canonical_history_changed:
+                    if _is_canonical_bot_chat and _canonical_latest_session_id:
+                        latest_session_id = _canonical_latest_session_id
+                    else:
+                        latest_session_id = _turn_db.resolve_resume_session_id(
+                            session_id
+                        )
                     if latest_session_id:
                         self.session_id = latest_session_id
                         task_context["session_id"] = latest_session_id

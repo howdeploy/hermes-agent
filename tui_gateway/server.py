@@ -143,6 +143,11 @@ from tui_gateway.render import make_stream_renderer, render_diff, render_message
 
 _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
+# JSON clients can only send serializable values, so identity against this
+# sentinel is an in-process-only capability.  Bot-chain RPC uses it to request
+# single-query approval semantics without exposing an auto-approval toggle to
+# Desktop/WebSocket callers.
+_IN_PROCESS_SINGLE_QUERY_PROOF = object()
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
 _answers: dict[str, str] = {}
@@ -4806,6 +4811,7 @@ def _set_session_context(
         # it instead of falling back to the gateway launch dir.
         resolved = cwd if cwd is not None else _cwd_for_session_key(session_key)
         source = _resolve_session_platform()
+        single_query = ""
         browser_control_principal = ""
         browser_control_transport_family = ""
         # Derive the live conversation id so terminal/execute_code subprocesses
@@ -4822,6 +4828,7 @@ def _set_session_context(
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
                     source = _session_source(sess)
+                    single_query = "1" if sess.get("single_query") else ""
                     session_id = (
                         getattr(sess.get("agent"), "session_id", None) or session_key
                     )
@@ -4844,6 +4851,7 @@ def _set_session_context(
             cwd=resolved,
             ui_session_id=ui_session_id,
             cron_session="",
+            single_query=single_query,
         )
     except Exception:
         return []

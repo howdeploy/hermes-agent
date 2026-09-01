@@ -16942,6 +16942,114 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
+    def _persist_bot_chain_exchange(self, user_message: str, response: str) -> None:
+        """Add a completed chain to this CLI session for context and /retry."""
+        timestamp = time.time()
+        messages = [
+            {"role": "user", "content": user_message, "timestamp": timestamp},
+            {"role": "assistant", "content": response, "timestamp": timestamp},
+        ]
+        if self._session_db is not None and self.session_id:
+            try:
+                self._session_db.append_messages_batch(self.session_id, messages)
+            except Exception:
+                logger.warning("Failed to persist CLI bot-chain exchange", exc_info=True)
+        self.conversation_history = [*self.conversation_history, *messages]
+
+    def _try_run_bot_chain(self, message, images: list = None) -> bool:
+        """Run a leading ``$Bot`` chain, returning False for ordinary chat."""
+        if not isinstance(message, str):
+            return False
+
+        from agent.bot_chain import (
+            BotChainCancelled,
+            BotChainControl,
+            BotChainError,
+            BotChainRunner,
+            BotChainSyntaxError,
+            format_bot_chain_result,
+            format_bot_chain_step,
+            parse_bot_chain_message,
+        )
+
+        try:
+            request = parse_bot_chain_message(message)
+        except BotChainSyntaxError as exc:
+            _cprint(f"  {_DIM}{exc}{_RST}")
+            return True
+        if request is None:
+            return False
+        if images:
+            _cprint("  Bot chains currently accept text messages only.")
+            return True
+
+        from hermes_cli.bot_profiles import resolve_bot_chain
+
+        rendered_steps: list[str] = []
+        response = ""
+        try:
+            profiles = resolve_bot_chain(request.names)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            response = f"Bot chain failed: {exc}"
+            _cprint(f"\n{response}")
+            self._persist_bot_chain_exchange(message, response)
+            return True
+
+        control = BotChainControl(
+            on_redirect=lambda payload: self._pending_input.put(payload)
+        )
+        previous_agent = self.agent
+        self.agent = control
+
+        def _show_step(step, index: int, total: int) -> None:
+            rendered = format_bot_chain_step(step, final=index == total - 1)
+            rendered_steps.append(rendered)
+            _cprint(f"\n{_ACCENT}{'─' * 40}{_RST}\n{rendered}")
+
+        try:
+            result = BotChainRunner().run(
+                profiles,
+                request.prompt,
+                control=control,
+                on_step=_show_step,
+            )
+            response = format_bot_chain_result(result)
+        except BotChainCancelled:
+            self._last_turn_interrupted = True
+            response = "\n\n".join([*rendered_steps, "Bot chain stopped."])
+            _cprint(f"\n{_DIM}Bot chain stopped.{_RST}")
+        except BotChainError as exc:
+            response = "\n\n".join([*rendered_steps, f"Bot chain failed: {exc}"])
+            _cprint(f"\nBot chain failed: {exc}")
+        finally:
+            if self.agent is control:
+                self.agent = previous_agent
+
+        self._persist_bot_chain_exchange(message, response)
+        return True
+
+    def _dispatch_chat_turn(
+        self,
+        message,
+        *,
+        images: list = None,
+        voice_input: bool = False,
+        seeded_query: bool = False,
+    ) -> None:
+        """Dispatch one chat turn after command/file routing is complete.
+
+        ``seeded_query`` documents the literal-input contract at this final
+        seam: seeded text bypasses slash/bang/file handlers, but deliberately
+        does not bypass the first-class ``$Bot`` chat router.
+        """
+        if seeded_query and isinstance(message, _SeededQueryMessage):
+            if images is None and message.images:
+                images = list(message.images)
+            message = message.text
+        if self._try_run_bot_chain(message, images=images):
+            return
+        self.chat(message, images=images, voice_input=voice_input)
+
     def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -18732,6 +18840,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # app, so without this the submitted "/steer <text>" can
                     # linger in the input area (looking unsent) and invite an
                     # accidental re-submit. See issue #34569.
+                    event.app.invalidate()
+                    return
+
+                # Bot chains run outside AIAgent but expose the same interrupt
+                # ABI. Handle /stop on the UI thread; the process loop is
+                # blocked in the chain runner and cannot dispatch it itself.
+                if (
+                    self._agent_running
+                    and not has_images
+                    and text.strip().lower() == "/stop"
+                    and getattr(self.agent, "_is_bot_chain_control", False)
+                ):
+                    request_hard_interrupt(self.agent, "/stop")
+                    _cprint("  Stopping bot chain...")
+                    event.app.current_buffer.reset(append_to_history=True)
                     event.app.invalidate()
                     return
 
@@ -21206,7 +21329,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self._dispatch_chat_turn(
+                            user_input,
+                            images=submit_images or None,
+                            voice_input=is_voice_input,
+                            seeded_query=is_seeded_query,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""

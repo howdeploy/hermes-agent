@@ -1,25 +1,27 @@
-"""Bot Mode roster probe — canonical Bot Chat system prompt section.
+"""Bot Mode roster probe — agent-to-agent messaging prompt sections.
 
 When the desktop's Bot Mode manages this install (any profile carries a
 ``ui_meta['hermes-bots']`` block in its profile.yaml), a bot's canonical
-"Bot Chat" session — and ONLY that session — gets a short "Messaging other
-agents" section so the bot can receive teammate DMs, reply with attribution,
-and hand off @mentions.  Regular sessions never carry the section; the
-desktop's composer middleware owns the @mention send path there.
+"Bot Chat" session gets the original "Messaging other agents" section so the
+bot can receive teammate DMs, reply with attribution, and hand off @mentions.
+Interactive CLI and Telegram user sessions with callable Bot Mode teammates
+get a companion section for the same ``message_agent`` contract. The
+desktop's composer middleware continues to own the @mention send path in
+ordinary Desktop chats.
 
-The caller (agent/system_prompt.py) enforces the session-title gate against
-``BOT_CHAT_TITLE``; this module answers "is this install Bot-Mode-managed,
-and what should the section say for this profile".
+The caller (agent/system_prompt.py) selects the Bot Chat or user-session gate;
+this module answers what the corresponding Bot Mode section should say for
+the active profile.
 
 This replaces the plugin-side SOUL.md backfill: the protocol is injected by
 the core at prompt-build time instead of appended to user-authored SOUL
-files.  If the profile's SOUL.md already carries the section (created by an
-older plugin version), the probe stays silent so the text never doubles up.
+files. Canonical Bot Chat text is deduplicated against the legacy heading;
+the CLI/Telegram contract uses its own explicit Bot Mode heading so an old
+shellout section cannot hide the structured tool instructions.
 
-Silent (returns ``""``) when:
-- no profile on this install is Bot-Mode-managed (the dominant case),
-- the current profile's SOUL.md already contains the protocol heading,
-- anything at all goes wrong (never crash a prompt build).
+Silent (returns ``""``) when the selected surface has no callable roster,
+its exact protocol already exists in SOUL.md, or anything at all goes wrong
+(never crash a prompt build).
 
 Deterministic within a process: the result is computed once and cached, so
 compression-triggered prompt rebuilds produce identical bytes.
@@ -34,6 +36,7 @@ import threading
 from pathlib import Path
 
 _PROTOCOL_HEADING = "## Messaging other agents"
+_USER_PROTOCOL_HEADING = "## Bot Mode: messaging other agents"
 
 # The canonical per-bot conversation title — the only session shape that
 # receives the protocol section. Must match the desktop plugin's
@@ -42,6 +45,7 @@ BOT_CHAT_TITLE = "Bot Chat"
 
 _lock = threading.Lock()
 _cached: dict[str, str] = {}
+_user_surface_cached: dict[str, str] = {}
 
 
 def _hermes_root(home: Path) -> Path:
@@ -118,6 +122,17 @@ def _soul_has_protocol(profile_dir: Path) -> bool:
         return False
 
 
+def _soul_has_user_protocol(profile_dir: Path) -> bool:
+    """True only for the CLI/Telegram Bot Mode protocol introduced by core."""
+    try:
+        soul = profile_dir / "SOUL.md"
+        return soul.is_file() and _USER_PROTOCOL_HEADING in soul.read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except Exception:
+        return False
+
+
 def _handle(name: str) -> str:
     # The mention middleware aliases the default profile as @hermes.
     return "hermes" if name == "default" else name
@@ -161,6 +176,28 @@ def _roster_lines(root: Path, me: str) -> list[str]:
     lines = []
     for name, profile_dir in _roster(root):
         if name == me:
+            continue
+        role = _profile_role(profile_dir)
+        handle = _handle(name)
+        lines.append(f"- `@{handle}`" + (f" — {role}" if role else ""))
+    return lines
+
+
+def _is_bot_enabled(profile_dir: Path) -> bool:
+    """Return the Bot Mode execution flag, defaulting to enabled."""
+    try:
+        from hermes_cli.profiles import read_profile_meta
+
+        return bool(read_profile_meta(profile_dir).get("bot_enabled", True))
+    except Exception:
+        return True
+
+
+def _user_surface_roster_lines(root: Path, me: str) -> list[str]:
+    """Enabled Bot Mode teammates exposed to CLI/Telegram user sessions."""
+    lines = []
+    for name, profile_dir in _roster(root):
+        if name == me or not _is_bot_enabled(profile_dir):
             continue
         role = _profile_role(profile_dir)
         handle = _handle(name)
@@ -285,6 +322,47 @@ def _build_section(home: Path) -> str:
     )
 
 
+def _build_user_surface_section(home: Path) -> str:
+    """Bot Mode protocol for interactive CLI and Telegram user chats."""
+    root = _hermes_root(home)
+    me = _profile_name(home)
+    my_dir = home if me == "default" else root / "profiles" / me
+    # The legacy plugin used the generic ``Messaging other agents`` heading
+    # for Bot Chat shellout instructions. That text is not sufficient for the
+    # CLI/Telegram natural-language ``message_agent`` contract, so dedupe only
+    # against this surface's own explicit Bot Mode heading.
+    if _soul_has_user_protocol(my_dir):
+        return ""
+
+    roster_lines = _user_surface_roster_lines(root, me)
+    if not roster_lines:
+        return ""
+    handle = _handle(me)
+    roster_block = "\n".join(roster_lines)
+    return (
+        f"{_USER_PROTOCOL_HEADING}\n"
+        "This session can use Bot Mode: named Hermes profiles are agent "
+        "teammates, and you have the `message_agent` tool to contact them. "
+        "It is FIRE-AND-FORGET: it delivers your message with your attribution "
+        "prefixed automatically and returns an acknowledgement immediately — "
+        "it never returns the reply. Send it, finish your turn, and the reply "
+        "arrives later as a background-process completion notification that "
+        "wakes you; relay it to the user then, attributed to that agent. "
+        "COMPOSE every message yourself — say what YOU need from that agent; "
+        "never forward the user's words verbatim, and never reveal private "
+        "1:1 chat content. When the user says \"ask <name>\", \"tell <name> "
+        "...\", or otherwise asks to involve a named teammate, call "
+        "message_agent directly; do not ask the user to retype special syntax. "
+        "Message ONE clearly relevant teammate; don't fan out to several "
+        "unless the user explicitly asked.\n"
+        f"You are `@{handle}`. Your Bot Mode teammates (live roster; roles "
+        "from their profiles):\n"
+        f"{roster_block}"
+        + _remote_paragraph(root)
+        + _peer_paragraph(root)
+    )
+
+
 def get_bot_mode_protocol_section(home: str | os.PathLike | None = None, *, force_refresh: bool = False) -> str:
     """Cached probe entry point — one filesystem pass per (process, home).
 
@@ -302,14 +380,35 @@ def get_bot_mode_protocol_section(home: str | os.PathLike | None = None, *, forc
         return _cached[resolved]
 
 
+def get_bot_mode_user_protocol_section(
+    home: str | os.PathLike | None = None,
+    *,
+    force_refresh: bool = False,
+) -> str:
+    """Cached Bot Mode protocol for interactive CLI/Telegram sessions."""
+    resolved = str(home) if home else (
+        os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    )
+    with _lock:
+        if force_refresh or resolved not in _user_surface_cached:
+            try:
+                _user_surface_cached[resolved] = _build_user_surface_section(
+                    Path(resolved)
+                )
+            except Exception:
+                _user_surface_cached[resolved] = ""
+        return _user_surface_cached[resolved]
+
+
 # ── capability epoch ─────────────────────────────────────────────────────────
 #
-# Bot Chat sessions are effectively eternal — the "new sessions come along
-# often" assumption behind build-once system prompts does not hold. When the
-# user changes a bot's capabilities (skills, toolsets, MCP servers, SOUL) or
-# the teammate roster changes, they expect the change to work on the NEXT
-# message. The fingerprint below hashes exactly that capability surface; the
-# built Bot Chat prompt embeds it, and the restore path in
+# Bot Chat sessions are effectively eternal, and CLI/Telegram conversations
+# can be resumed for just as long — the "new sessions come along often"
+# assumption behind build-once system prompts does not hold. When the user
+# changes a bot's capabilities (skills, toolsets, MCP servers, SOUL) or the
+# teammate roster changes, they expect the change to work on the NEXT process
+# restore. The fingerprint below hashes exactly that Bot Mode capability
+# surface; the built prompt embeds it, and the restore path in
 # agent/conversation_loop.py rebuilds the prompt when the stored epoch no
 # longer matches the disk state. This is the /model exception applied to
 # capabilities: a LOUD, USER-INITIATED, once-per-change cache break — never
@@ -372,6 +471,9 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     try:
         root = _hermes_root(resolved)
         surface["roster"] = sorted(n for n, d in _roster(root) if _is_bot_managed(d))
+        surface["callable_roster"] = sorted(
+            n for n, d in _roster(root) if _is_bot_enabled(d)
+        )
         # Roles are part of the messaging surface: renaming a bot or editing
         # a profile description must refresh eternal Bot Chat prompts so the
         # roster block teammates pick recipients from stays current.
@@ -411,15 +513,15 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
 
 
 def epoch_line(home: str | os.PathLike | None = None) -> str:
-    """The epoch stamp appended to a Bot Chat prompt."""
+    """The epoch stamp appended to a Bot Mode messaging prompt."""
     return f"{_EPOCH_PREFIX}{capability_fingerprint(home)}"
 
 
 def stored_prompt_capability_stale(stored_prompt: str, home: str | os.PathLike | None = None) -> bool:
-    """True when ``stored_prompt`` is a Bot Chat prompt whose embedded
+    """True when ``stored_prompt`` is a Bot Mode prompt whose embedded
     capability epoch no longer matches the current disk state.
 
-    Non-Bot-Chat prompts (no epoch stamp) are never stale by this check.
+    Non-Bot-Mode prompts (no epoch stamp) are never stale by this check.
     Fails closed to "not stale" — a broken probe must never turn into a
     rebuild-every-turn cache burner.
     """
@@ -464,6 +566,22 @@ def stored_bot_chat_prompt_needs_upgrade(stored_prompt: str, home: str | os.Path
         return False
 
 
+def stored_bot_mode_user_prompt_needs_upgrade(
+    stored_prompt: str,
+    home: str | os.PathLike | None = None,
+) -> bool:
+    """True when an eligible CLI/Telegram prompt predates Bot Mode messaging."""
+    try:
+        if _EPOCH_PREFIX in (stored_prompt or ""):
+            return False
+        if _USER_PROTOCOL_HEADING in (stored_prompt or ""):
+            return False
+        return bool(get_bot_mode_user_protocol_section(home))
+    except Exception:
+        return False
+
+
 def _reset_cache_for_tests() -> None:
     with _lock:
         _cached.clear()
+        _user_surface_cached.clear()

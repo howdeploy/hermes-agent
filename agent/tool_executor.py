@@ -2113,8 +2113,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent._vprint(f"  {_get_cute_tool_message_impl('todo_list', function_args, tool_duration, result=function_result)}")
         elif function_name == "message_agent":
             # Bot Mode teammate DM (tools/bot_mode_dm.py) — injected, not
-            # registered: only a canonical Bot Chat session carries the
-            # schema, and the tool re-gates on the session title itself.
+            # registered. Canonical Bot Chats and eligible CLI/Telegram user
+            # sessions carry the schema; the tool repeats the same capability
+            # gate at dispatch time.
             def _execute(next_args: dict) -> Any:
                 from tools.bot_mode_dm import message_agent_tool as _message_agent_tool
                 return _message_agent_tool(

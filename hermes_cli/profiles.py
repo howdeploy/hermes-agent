@@ -723,6 +723,9 @@ class ProfileInfo:
     # Optional user-facing display name from profile.yaml. Presentation
     # only — resolution/comparison/spawn paths always use ``name``.
     display_name: str = ""
+    # Bot-chain execution gate. Every Hermes profile is a Bot Mode bot;
+    # legacy profiles have no explicit metadata and remain enabled.
+    bot_enabled: bool = True
 
 
 def _read_distribution_meta(profile_dir: Path) -> tuple:
@@ -941,11 +944,17 @@ def read_profile_meta(profile_dir: Path) -> dict:
     """Read ``<profile_dir>/profile.yaml`` and return a dict.
 
     Returns ``{"description": "", "description_auto": False,
-    "display_name": ""}`` when the file is missing or unreadable. Never
+    "display_name": "", "bot_enabled": True}`` when the file is missing
+    or unreadable. Never
     raises — a corrupt profile.yaml on an unrelated profile must not
     break ``hermes profile list``.
     """
-    empty = {"description": "", "description_auto": False, "display_name": ""}
+    empty = {
+        "description": "",
+        "description_auto": False,
+        "display_name": "",
+        "bot_enabled": True,
+    }
     path = _profile_yaml_path(profile_dir)
     if not path.is_file():
         return empty
@@ -957,10 +966,16 @@ def read_profile_meta(profile_dir: Path) -> dict:
         return empty
     if not isinstance(data, dict):
         return empty
+    bot_meta = data.get("bot")
     return {
         "description": str(data.get("description") or "").strip(),
         "description_auto": bool(data.get("description_auto", False)),
         "display_name": str(data.get("display_name") or "").strip(),
+        "bot_enabled": (
+            bool(bot_meta.get("enabled", True))
+            if isinstance(bot_meta, dict)
+            else True
+        ),
     }
 
 
@@ -970,6 +985,7 @@ def write_profile_meta(
     description: Optional[str] = None,
     description_auto: Optional[bool] = None,
     display_name: Optional[str] = None,
+    bot_enabled: Optional[bool] = None,
 ) -> None:
     """Update ``<profile_dir>/profile.yaml`` in place.
 
@@ -1000,6 +1016,12 @@ def write_profile_meta(
             existing["display_name"] = display_name.strip()
         else:
             existing.pop("display_name", None)
+    if bot_enabled is not None:
+        bot_meta = existing.get("bot")
+        if not isinstance(bot_meta, dict):
+            bot_meta = {}
+        bot_meta["enabled"] = bool(bot_enabled)
+        existing["bot"] = bot_meta
     # Atomic write: bare open("w") truncates before the dump, and the read
     # path above swallows parse errors as {}, so a crashed write would
     # silently drop unspecified fields on the next call (#51356, #16743).
@@ -1068,6 +1090,7 @@ def list_profiles() -> List[ProfileInfo]:
             description=meta.get("description", ""),
             description_auto=meta.get("description_auto", False),
             display_name=meta.get("display_name", ""),
+            bot_enabled=meta.get("bot_enabled", True),
         ))
 
     # Named profiles
@@ -1116,6 +1139,7 @@ def list_profiles() -> List[ProfileInfo]:
                 description=meta.get("description", ""),
                 description_auto=meta.get("description_auto", False),
                 display_name=meta.get("display_name", ""),
+                bot_enabled=meta.get("bot_enabled", True),
             ))
 
     return profiles
@@ -2542,7 +2566,7 @@ def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) ->
         print(f"✓ Honcho host updated: {source_host} → {new_host}")
 
 
-def rename_profile(old_name: str, new_name: str) -> Path:
+def rename_profile(old_name: str, new_name: str, *, no_alias: bool = False) -> Path:
     """Rename a profile: directory, wrapper script, service, active_profile.
 
     The default profile's home IS the installation root, so "renaming" it
@@ -2588,14 +2612,16 @@ def rename_profile(old_name: str, new_name: str) -> Path:
     # 3. Update profile-scoped Honcho host blocks, preserving aiPeer identity
     _migrate_honcho_profile_host(old_canon, new_canon, new_dir)
 
-    # 4. Update wrapper script
+    # 4. Update wrapper script unless the caller owns a profile surface that
+    # deliberately has no command alias (for example ``hermes bots``).
     remove_wrapper_script(old_canon)
-    collision = check_alias_collision(new_canon)
-    if not collision:
-        create_wrapper_script(new_canon)
-        print(f"✓ Alias updated: {new_canon}")
-    else:
-        print(f"⚠ Cannot create alias '{new_canon}' — {collision}")
+    if not no_alias:
+        collision = check_alias_collision(new_canon)
+        if not collision:
+            create_wrapper_script(new_canon)
+            print(f"✓ Alias updated: {new_canon}")
+        else:
+            print(f"⚠ Cannot create alias '{new_canon}' — {collision}")
 
     # 5. Update active_profile if it pointed to old name
     try:

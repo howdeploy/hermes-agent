@@ -16,7 +16,7 @@ instead of rebuilding).  Covers:
 from __future__ import annotations
 
 import logging
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -112,6 +112,39 @@ class TestStoredPromptReuse:
             agent.session_id, agent._cached_system_prompt
         )
         assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
+
+    def test_existing_cli_chat_migrates_to_bot_mode_prompt_once(self):
+        stored = "Stored prompt from before CLI Bot Mode messaging"
+        rebuilt = "Rebuilt prompt with Bot Mode messaging\n\nCapability epoch: abc123def456"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db, prebuilt_prompt=rebuilt)
+        agent._session_title_hint = "Project discussion"
+
+        with (
+            patch(
+                "tools.bot_mode_dm.message_agent_session_kind",
+                return_value="user",
+            ),
+            patch(
+                "tools.bot_mode_probe.stored_prompt_capability_stale",
+                return_value=False,
+            ),
+            patch(
+                "tools.bot_mode_probe.stored_bot_mode_user_prompt_needs_upgrade",
+                return_value=True,
+            ),
+        ):
+            _restore_or_build_system_prompt(
+                agent,
+                None,
+                [{"role": "user", "content": "Ask the researcher."}],
+            )
+
+        assert agent._cached_system_prompt == rebuilt
+        assert agent._session_title_hint == "Project discussion"
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once_with(agent.session_id, rebuilt)
 
 
 # ---------------------------------------------------------------------------

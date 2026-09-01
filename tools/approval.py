@@ -292,7 +292,7 @@ def _is_unattended_platform_approval_context() -> bool:
 
 
 def _is_single_query_approval_context() -> bool:
-    """True when the current approval decision is from a single-query (-q) session.
+    """True for a finite one-turn session with no approval responder.
 
     ``hermes chat -q "..."`` runs one turn and exits with no user waiting to
     answer approval prompts, but it still exports ``HERMES_INTERACTIVE=1`` so
@@ -303,10 +303,10 @@ def _is_single_query_approval_context() -> bool:
     via ``execute_code``, which also auto-approves in non-gateway mode). An
     explicit ``single_query_mode`` config makes that path deterministic.
 
-    Prefer the session ContextVar so a gateway/API turn spawned concurrently
-    cannot taint unrelated CLI work in the same process (single-query is a
-    CLI-only construct; interactivity is decided in cli.py). Falls back to the
-    legacy process env var for CLI/tests that don't engage the session context.
+    Trusted in-process bot-chain turns use the same unattended contract. Prefer
+    the session ContextVar so one such turn cannot taint unrelated CLI/gateway
+    work in the same process. Falls back to the legacy process env var for
+    CLI/tests that don't engage the session context.
     """
     try:
         from gateway.session_context import get_session_env

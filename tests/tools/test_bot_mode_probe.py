@@ -68,6 +68,41 @@ def test_emits_for_named_profile_with_own_handle(tmp_path):
     assert "`@coder`" not in roster_block
 
 
+def test_user_surface_emits_bot_mode_invocation_guidance(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _make_bot_profile(home, "researcher", managed=False)
+
+    section = bot_mode_probe.get_bot_mode_user_protocol_section(home)
+
+    assert section.startswith("## Bot Mode: messaging other agents")
+    assert "This session can use Bot Mode" in section
+    assert "ask <name>" in section
+    assert "message_agent directly" in section
+    assert "do not ask the user to retype special syntax" in section
+    assert "`@researcher`" in section
+
+
+def test_user_surface_omits_disabled_bot_mode_teammates(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    enabled = _make_bot_profile(home, "writer", managed=False)
+    disabled = _make_bot_profile(home, "reviewer", managed=False)
+    (enabled / "profile.yaml").write_text(
+        "bot:\n  enabled: true\n",
+        encoding="utf-8",
+    )
+    (disabled / "profile.yaml").write_text(
+        "bot:\n  enabled: false\n",
+        encoding="utf-8",
+    )
+
+    section = bot_mode_probe.get_bot_mode_user_protocol_section(home)
+
+    assert "`@writer`" in section
+    assert "`@reviewer`" not in section
+
+
 def test_roster_lines_carry_roles(tmp_path):
     """Bots must know WHO to message: the roster carries title/description."""
     import textwrap as _tw
@@ -115,6 +150,33 @@ def test_deterministic_across_calls(tmp_path):
     _make_bot_profile(home, "newbot", managed=True)
     second = bot_mode_probe.get_bot_mode_protocol_section(home)
     assert first == second
+
+
+def test_user_surface_section_is_deterministic_across_calls(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _make_bot_profile(home, "researcher", managed=False)
+    first = bot_mode_probe.get_bot_mode_user_protocol_section(home)
+
+    _make_bot_profile(home, "writer", managed=False)
+    second = bot_mode_probe.get_bot_mode_user_protocol_section(home)
+
+    assert first == second
+
+
+def test_legacy_soul_protocol_does_not_hide_user_surface_bot_mode(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _make_bot_profile(home, "researcher", managed=False)
+    (home / "SOUL.md").write_text(
+        "# Assistant\n\n## Messaging other agents\nlegacy shellout protocol\n",
+        encoding="utf-8",
+    )
+
+    section = bot_mode_probe.get_bot_mode_user_protocol_section(home)
+
+    assert section.startswith("## Bot Mode: messaging other agents")
+    assert "message_agent directly" in section
 
 
 def test_never_raises_on_garbage(tmp_path, monkeypatch):
@@ -193,7 +255,7 @@ def test_stored_prompt_staleness(tmp_path):
     restamped = "system stuff\n\n" + bot_mode_probe.epoch_line(home)
     assert not bot_mode_probe.stored_prompt_capability_stale(restamped, home)
 
-    # prompts without a stamp (every non-Bot-Chat session) are never stale
+    # Prompts without a Bot Mode stamp are never stale by this check.
     assert not bot_mode_probe.stored_prompt_capability_stale("ordinary prompt", home)
     assert not bot_mode_probe.stored_prompt_capability_stale("", home)
 
@@ -227,6 +289,30 @@ def test_legacy_bot_chat_upgrade(tmp_path):
     home2 = tmp_path / ".hermes2"
     home2.mkdir()
     assert not bot_mode_probe.stored_bot_chat_prompt_needs_upgrade(legacy, home2)
+
+
+def test_existing_user_session_gets_one_time_bot_mode_upgrade(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _make_bot_profile(home, "researcher", managed=False)
+    legacy = "ordinary stored system prompt"
+
+    assert bot_mode_probe.stored_bot_mode_user_prompt_needs_upgrade(legacy, home)
+    assert bot_mode_probe.stored_bot_mode_user_prompt_needs_upgrade(
+        legacy + "\n\n## Messaging other agents\nlegacy shellout protocol",
+        home,
+    )
+
+    upgraded = (
+        legacy
+        + "\n\n"
+        + bot_mode_probe.get_bot_mode_user_protocol_section(home)
+        + "\n\n"
+        + bot_mode_probe.epoch_line(home)
+    )
+    assert not bot_mode_probe.stored_bot_mode_user_prompt_needs_upgrade(
+        upgraded, home
+    )
 
 
 # ── peer gateways (cross-machine DMs) ────────────────────────────────────────

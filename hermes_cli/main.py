@@ -474,6 +474,7 @@ from hermes_cli.subcommands.cron import build_cron_parser
 from hermes_cli.subcommands.sync import build_sync_parser
 from hermes_cli.subcommands.gateway import build_gateway_parser
 from hermes_cli.subcommands.profile import build_profile_parser
+from hermes_cli.subcommands.bots import build_bots_parser
 from hermes_cli.subcommands.model import build_model_parser
 from hermes_cli.subcommands.setup import build_setup_parser
 
@@ -11207,6 +11208,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "update",
         "uninstall",
         "profile",
+        "bots",
         "dashboard",
         "serve",
         "desktop",
@@ -11250,6 +11252,13 @@ def _coalesce_session_name_args(argv: list) -> list:
             result.append(token)
             i += 1
     return result
+
+
+def cmd_bots(args):
+    """Manage persistent Bot Mode profiles."""
+    from hermes_cli.bot_profiles import run_bots_command
+
+    return run_bots_command(args)
 
 
 def cmd_profile(args):
@@ -15013,6 +15022,7 @@ def main():
     # profile command  (parser built in hermes_cli/subcommands/profile.py)
     # =========================================================================
     build_profile_parser(subparsers, cmd_profile=cmd_profile)
+    build_bots_parser(subparsers, cmd_bots=cmd_bots)
 
     # =========================================================================
     # completion command

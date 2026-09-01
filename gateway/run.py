@@ -8683,6 +8683,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         return True
 
+    def _telegram_topic_bound_bot(self, source: SessionSource) -> Optional[str]:
+        """Bot profile bound to a Telegram topic titled ``$Name`` (or None).
+
+        A Telegram DM/forum topic whose title starts with ``$`` (e.g.
+        ``$writer``) is bound to that Bot Mode profile: every text message in the
+        topic runs as a bot chain headed by the bound bot and the default
+        profile does not answer there. Returns None when the topic has no
+        ``$Name`` title or the named bot is missing/disabled/unconfigured.
+        """
+        if source.platform != Platform.TELEGRAM:
+            return None
+        topic_name = str(getattr(source, "chat_topic", "") or "").strip()
+        if not topic_name.startswith("$"):
+            return None
+        candidate = topic_name[1:].strip()
+        if not candidate:
+            return None
+        try:
+            from hermes_cli.bot_profiles import get_bot_profile
+
+            profile = get_bot_profile(candidate)
+        except Exception:
+            logger.debug(
+                "topic-bot-binding: no runnable bot for topic '%s'", topic_name, exc_info=True
+            )
+            return None
+        if not profile.enabled or not profile.provider or not profile.model:
+            return None
+        return profile.name
+
     _TELEGRAM_LOBBY_REMINDER_COOLDOWN_S = 30.0
 
     def _telegram_topic_cooldown_key(self, source: SessionSource) -> Optional[str]:
@@ -19518,6 +19548,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if queue_during_drain
                     else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
                 )
+            if (
+                getattr(running_agent, "_is_bot_chain_control", False)
+                and effective_busy_input_mode == "interrupt"
+            ):
+                # A chain has no live parent AIAgent that can absorb redirect
+                # text. Cancel it and preserve the complete incoming event as
+                # the next turn instead of losing the user's correction.
+                running_agent.interrupt()
+                self._queue_or_replace_pending_event(_quick_key, event)
+                return None
             if effective_busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
                 self._queue_or_replace_pending_event(_quick_key, event)
@@ -21231,6 +21271,94 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    async def _handle_bot_chain_turn(
+        self,
+        event,
+        session_entry,
+        routing_key: str,
+        request,
+    ) -> Optional[str]:
+        """Run and persist one ``$Bot`` chain under the gateway turn lease."""
+        from agent.bot_chain import (
+            BotChainCancelled,
+            BotChainControl,
+            BotChainError,
+            BotChainRunner,
+            format_bot_chain_result,
+        )
+        from hermes_cli.bot_profiles import resolve_bot_chain
+
+        if event.message_id and await self.async_session_store.has_platform_message_id(
+            session_entry.session_id, str(event.message_id)
+        ):
+            logger.info(
+                "Skipping duplicate bot-chain turn (message_id=%s) in session %s",
+                event.message_id,
+                session_entry.session_id,
+            )
+            return None
+
+        control = BotChainControl()
+        chain_state = self._session_state(routing_key)
+        chain_state.turn.agent = control
+        chain_state.turn.started_ts = time.time()
+
+        response: str
+        cancelled = False
+        try:
+            profiles = await asyncio.to_thread(resolve_bot_chain, request.names)
+            result = await asyncio.to_thread(
+                BotChainRunner().run,
+                profiles,
+                request.prompt,
+                control=control,
+            )
+            response = format_bot_chain_result(result)
+        except BotChainCancelled:
+            cancelled = True
+            response = "Bot chain stopped."
+        except (BotChainError, FileNotFoundError, OSError, ValueError) as exc:
+            response = f"Bot chain failed: {exc}"
+        except Exception as exc:
+            logger.exception("Unexpected bot-chain failure for session %s", routing_key)
+            response = f"Bot chain failed: {exc}"
+
+        timestamp = time.time()
+        user_entry = {
+            "role": "user",
+            "content": event.text or "",
+            "timestamp": timestamp,
+        }
+        if event.message_id:
+            user_entry["message_id"] = str(event.message_id)
+        try:
+            await self.async_session_store.append_to_transcript(
+                session_entry.session_id,
+                user_entry,
+            )
+            await self.async_session_store.append_to_transcript(
+                session_entry.session_id,
+                {
+                    "role": "assistant",
+                    "content": response,
+                    "timestamp": timestamp,
+                },
+            )
+            await self.async_session_store.update_session(
+                session_entry.session_key,
+                touch_activity=not bool(getattr(event, "internal", False)),
+            )
+        except Exception:
+            logger.warning(
+                "Failed to persist bot-chain exchange for session %s",
+                session_entry.session_id,
+                exc_info=True,
+            )
+
+        # /stop already sends the operator its own acknowledgement. Suppress a
+        # second delivery from the unwinding chain task.
+        return None if cancelled else response
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -21243,6 +21371,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _platform_name, source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
+
+        _bot_chain_request = None
+        if (
+            source.platform == Platform.TELEGRAM
+            and event.message_type == MessageType.TEXT
+            and not getattr(event, "internal", False)
+        ):
+            from agent.bot_chain import (
+                BotChainSyntaxError,
+                bind_topic_bot,
+                parse_bot_chain_message,
+            )
+
+            _bot_chain_text = event.text or ""
+            _bot_chain_syntax_error = None
+            try:
+                _bot_chain_request = parse_bot_chain_message(_bot_chain_text)
+            except BotChainSyntaxError as exc:
+                _bot_chain_request = None
+                _bot_chain_syntax_error = exc
+            # A Telegram topic titled ``$Name`` is bound to that Bot Mode profile:
+            # the bound bot always answers there (plain messages included),
+            # and explicit ``$Other`` tokens are additional invited bots.
+            _bound_bot = await asyncio.to_thread(
+                self._telegram_topic_bound_bot, source
+            )
+            if _bound_bot is not None:
+                _bot_chain_request = bind_topic_bot(
+                    _bot_chain_request, _bound_bot, _bot_chain_text
+                )
+            elif _bot_chain_syntax_error is not None:
+                return str(_bot_chain_syntax_error)
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
@@ -21408,6 +21568,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": session_entry.session_id,
                 "session_key": session_key,
             })
+
+        if _bot_chain_request is not None:
+            return await self._handle_bot_chain_turn(
+                event,
+                session_entry,
+                _quick_key,
+                _bot_chain_request,
+            )
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)

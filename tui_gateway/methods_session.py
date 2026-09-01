@@ -33,7 +33,16 @@ def _(rid, params: dict) -> dict:
         explicit_cwd = False
     resolved_cwd = _completion_cwd(params)
     source = _resolve_session_source(str(params.get("source") or "").strip() or None)
-    _enable_gateway_prompts()
+    single_query = (
+        params.get("_single_query_proof") is _IN_PROCESS_SINGLE_QUERY_PROOF
+    )
+    # Trusted in-process one-turn callers mirror ``hermes chat -Q``: approval
+    # behavior is bound through the session ContextVar below, and no gateway
+    # prompt can be answered.  Do not leak gateway/ask mode into the hosting
+    # CLI process after a bot-chain turn.  Serializable Desktop/WebSocket
+    # clients still take the established interactive gateway path.
+    if not single_query:
+        _enable_gateway_prompts()
 
     # ``profile`` (app-global remote mode): a new chat started under a non-launch
     # profile must build its agent + persist against THAT profile's home/state.db,
@@ -105,6 +114,7 @@ def _(rid, params: dict) -> dict:
             "running": False,
             "session_key": key,
             "show_reasoning": _load_show_reasoning(),
+            "single_query": single_query,
             "source": source,
             "slash_worker": None,
             "tool_progress_mode": _load_tool_progress_mode(),
@@ -2917,7 +2927,20 @@ def _(rid, params: dict) -> dict:
             f"Agent Running: {'Yes' if session.get('running') else 'No'}",
         ]
     )
-    return _ok(rid, {"output": "\n".join(lines)})
+    running = bool(session.get("running"))
+    run_thread = session.get("_run_thread")
+    is_alive = getattr(run_thread, "is_alive", None)
+    turn_settled = not running and not (
+        callable(is_alive) and is_alive()
+    )
+    return _ok(
+        rid,
+        {
+            "output": "\n".join(lines),
+            "running": running,
+            "turn_settled": turn_settled,
+        },
+    )
 
 
 @method("session.history")

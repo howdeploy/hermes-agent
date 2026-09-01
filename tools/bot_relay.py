@@ -561,8 +561,21 @@ def _hermes_cli() -> str:
     return "hermes"
 
 
-def local_delivery_command(profile: str, query_file: str) -> list[str]:
-    """argv that delivers a DM into ``profile``'s Bot Chat on THIS gateway."""
+def local_delivery_command(
+    profile: str,
+    query_file: str,
+    *,
+    conversation_name: str = "Bot Chat",
+) -> list[str]:
+    """Build argv for one local profile turn.
+
+    Bot Mode callers keep the canonical ``Bot Chat`` default. Callers that
+    must not share that interactive session, such as bot chains, pass their
+    own unique conversation title while retaining the same Hermes routing.
+    """
+    conversation_name = str(conversation_name or "").strip()
+    if not conversation_name:
+        raise ValueError("conversation_name cannot be empty")
     return [
         _hermes_cli(),
         "-p",
@@ -571,7 +584,7 @@ def local_delivery_command(profile: str, query_file: str) -> list[str]:
         "--in",
         "~",
         "-c",
-        "Bot Chat",
+        conversation_name,
         "--create-if-missing",
         "-Q",
         "--query-file",
@@ -581,9 +594,10 @@ def local_delivery_command(profile: str, query_file: str) -> list[str]:
 
 # ── per-profile turn lock (#93091) ───────────────────────────────────────────
 #
-# Two deliveries into the SAME target profile must never run their Bot Chat
-# turns concurrently: deliveries spawn separate ``hermes`` subprocesses, so
-# an in-memory mutex is useless — the lock is a per-profile lockfile under
+# Two deliveries into the SAME target profile must never run profile turns
+# concurrently: Bot Mode targets ``Bot Chat`` while chains may target isolated
+# conversations, but both spawn separate ``hermes`` subprocesses. An in-memory
+# mutex is therefore useless — the lock is a per-profile lockfile under
 # ``<root>/bot_relay/locks/`` held with ``fcntl.flock`` for exactly the turn
 # execution window. flock is released by the kernel when the holder's fd
 # closes (including process death), so a crashed turn can never wedge the

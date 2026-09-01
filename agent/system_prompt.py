@@ -724,40 +724,40 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             # Probe failure must never block prompt build.
             pass
 
-    # Bot Mode teammate protocol — injected ONLY into a bot's canonical
-    # "Bot Chat" session (the conversation teammate bots message into via
-    # `hermes -p <bot> chat --in ~ -c "Bot Chat"` and the desktop pins), on
-    # installs where Bot Mode manages profiles (ui_meta['hermes-bots']).
-    # Regular sessions never carry it — the desktop's composer middleware
-    # owns the @mention send path. Title is read once at first build and the
-    # rendered prompt is cached + DB-restored, so this is cache-safe.
+    # Bot Mode teammate protocol. Desktop keeps its original canonical
+    # "Bot Chat" gate (the conversation teammate bots message into via
+    # `hermes -p <bot> chat --in ~ -c "Bot Chat"`). Interactive CLI and
+    # Telegram user sessions with configured Bot Mode teammates receive the
+    # matching natural-language invocation contract. Internal Bot Chain,
+    # group-room, one-shot, cron, and subagent sessions remain excluded by
+    # message_agent_session_kind(). The verdict and rendered prompt are cached
+    # for the session lifetime, preserving the prompt prefix.
     # Gated by config.yaml ``agent.bot_mode_protocol`` (default True).
     if getattr(agent, "_bot_mode_protocol", True):
         try:
+            from tools.bot_mode_dm import message_agent_session_kind
             from tools.bot_mode_probe import (
-                BOT_CHAT_TITLE,
                 epoch_line,
                 get_bot_mode_protocol_section,
+                get_bot_mode_user_protocol_section,
             )
-            _title = str(getattr(agent, "_session_title_hint", "") or "").strip()
-            if not _title:
-                _sdb = getattr(agent, "_session_db", None)
-                _sid = getattr(agent, "session_id", None)
-                _title = str((_sdb.get_session_title(_sid) if (_sdb and _sid) else None) or "").strip()
-            if _title == BOT_CHAT_TITLE:
-                _bot_section = get_bot_mode_protocol_section(_agent_home(agent))
+            _bot_mode_session_kind = message_agent_session_kind(agent)
+            if _bot_mode_session_kind:
+                _bot_home = _agent_home(agent)
+                _bot_section = (
+                    get_bot_mode_protocol_section(_bot_home)
+                    if _bot_mode_session_kind == "bot_chat"
+                    else get_bot_mode_user_protocol_section(_bot_home)
+                )
                 if _bot_section:
                     post_workspace_parts.append(_bot_section)
-                    # Eternal-session support: stamp the capability epoch so
-                    # the restore path can detect user-initiated capability
-                    # changes (skills/toolsets/MCP/SOUL/roster) and rebuild
-                    # ONCE per change instead of waiting for /new or
-                    # compression. Also marks this prompt as timeless — the
-                    # volatile timestamp line is omitted (see below), since a
-                    # birth date pinned in a session that lives for months is
-                    # misinformation.
-                    post_workspace_parts.append(epoch_line(_agent_home(agent)))
-                    agent._bot_chat_timeless_prompt = True
+                    # Stamp the Bot Mode capability epoch so restored sessions
+                    # can migrate once and then reuse identical prompt bytes.
+                    post_workspace_parts.append(epoch_line(_bot_home))
+                    if _bot_mode_session_kind == "bot_chat":
+                        # Canonical Bot Chats are timeless forever-chats; omit
+                        # the volatile prompt birth stamp for them as before.
+                        agent._bot_chat_timeless_prompt = True
         except Exception:
             pass
 

@@ -1,8 +1,9 @@
-"""Tests for tools/bot_mode_dm.py — the Bot-Chat-only ``message_agent`` tool.
+"""Tests for tools/bot_mode_dm.py — the Bot Mode ``message_agent`` tool.
 
-The containment contract is the headline here: the tool must exist ONLY in a
-canonical Bot Chat session on a Bot-Mode-managed install, and must refuse to
-deliver from anywhere else even if a schema leaks.
+The containment contract is the headline here: Desktop keeps the canonical
+Bot Chat gate, interactive CLI/Telegram sessions with bot teammates share the
+same Bot Mode tool, and every internal or unsupported surface must refuse to
+deliver even if a schema leaks.
 """
 
 import json
@@ -61,19 +62,28 @@ class _FakeDB:
 
 
 class _FakeAgent:
-    def __init__(self, home: Path, title: str = "Bot Chat"):
+    def __init__(
+        self,
+        home: Path,
+        title: str = "Bot Chat",
+        *,
+        platform: str | None = None,
+        gateway_session_key: str | None = None,
+    ):
         self._session_db = _FakeDB(home, title)
         self.session_id = "sess-1"
         self._session_title_hint = None
         self._bot_mode_protocol = True
+        self.platform = platform
+        self._gateway_session_key = gateway_session_key
         self.tools: list = []
         self.valid_tool_names: set = set()
 
 
-# ── injection gate (leak containment) ────────────────────────────────────────
+# ── injection gate (Bot Mode surface containment) ───────────────────────────
 
 
-def test_injects_only_into_bot_chat_on_managed_install(tmp_path):
+def test_injects_into_bot_chat_on_managed_install(tmp_path):
     home = _managed_home(tmp_path)
     agent = _FakeAgent(home, title="Bot Chat")
     assert bot_mode_dm.ensure_message_agent_tool(agent) is True
@@ -86,17 +96,108 @@ def test_injects_only_into_bot_chat_on_managed_install(tmp_path):
     assert len(agent.tools) == 1
 
 
-@pytest.mark.parametrize(
-    "title",
-    ["", "My research chat", "Group: room-abc123", "handoff-12ab34cd"],
-)
-def test_never_injects_outside_bot_chat(tmp_path, title):
-    """CLI sessions, ordinary chats, group-room member sessions: no tool."""
+@pytest.mark.parametrize("platform", ["cli", "telegram"])
+def test_injects_into_interactive_cli_and_telegram_sessions(tmp_path, platform):
     home = _managed_home(tmp_path)
-    agent = _FakeAgent(home, title=title)
+    agent = _FakeAgent(
+        home,
+        title="Project discussion",
+        platform=platform,
+        gateway_session_key=(
+            "agent:main:telegram:dm:test" if platform == "telegram" else None
+        ),
+    )
+
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is True
+    assert [tool["function"]["name"] for tool in agent.tools] == [
+        bot_mode_dm.MESSAGE_AGENT_TOOL_NAME
+    ]
+
+
+@pytest.mark.parametrize(
+    ("title", "platform"),
+    [
+        ("Ordinary desktop chat", "desktop"),
+        ("Ordinary TUI chat", "tui"),
+        ("Group: room-abc123", "cli"),
+        ("Bot Chain 12ab34cd", "telegram"),
+    ],
+)
+def test_never_injects_into_unsupported_or_internal_sessions(
+    tmp_path, title, platform
+):
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title=title, platform=platform)
     assert bot_mode_dm.ensure_message_agent_tool(agent) is False
     assert agent.tools == []
     assert agent.valid_tool_names == set()
+
+
+def test_never_injects_into_single_query_session(tmp_path):
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    home = _managed_home(tmp_path)
+    tokens = set_session_vars(platform="telegram", single_query="1")
+    try:
+        agent = _FakeAgent(
+            home,
+            title="One-shot request",
+            platform="telegram",
+            gateway_session_key="agent:main:telegram:dm:test",
+        )
+        assert bot_mode_dm.ensure_message_agent_tool(agent) is False
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_false_single_query_marker_keeps_interactive_telegram_enabled(tmp_path):
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    home = _managed_home(tmp_path)
+    tokens = set_session_vars(platform="telegram", single_query="0")
+    try:
+        agent = _FakeAgent(
+            home,
+            title="Project discussion",
+            platform="telegram",
+            gateway_session_key="agent:main:telegram:dm:test",
+        )
+        assert bot_mode_dm.ensure_message_agent_tool(agent) is True
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_never_injects_into_detached_telegram_background_task(tmp_path):
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(
+        home,
+        title="Background task",
+        platform="telegram",
+        gateway_session_key=None,
+    )
+
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is False
+
+
+def test_never_injects_into_cron_session(tmp_path):
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    home = _managed_home(tmp_path)
+    tokens = set_session_vars(platform="cli", cron_session="1")
+    try:
+        agent = _FakeAgent(home, title="Scheduled task", platform="cli")
+        assert bot_mode_dm.ensure_message_agent_tool(agent) is False
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_never_injects_into_delegated_child(tmp_path):
+    from agent.delegation_context import delegated_child_context
+
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="Delegated task", platform="cli")
+    with delegated_child_context("child-session"):
+        assert bot_mode_dm.ensure_message_agent_tool(agent) is False
 
 
 def test_never_injects_on_unmanaged_install(tmp_path):
@@ -130,14 +231,47 @@ def test_schema_never_in_global_registry():
 # ── dispatch gate (defense in depth) ─────────────────────────────────────────
 
 
-def test_tool_refuses_outside_bot_chat(tmp_path):
+def test_tool_refuses_outside_supported_bot_mode_surfaces(tmp_path):
     home = _managed_home(tmp_path)
-    agent = _FakeAgent(home, title="Ordinary chat")
+    agent = _FakeAgent(
+        home,
+        title="Ordinary desktop chat",
+        platform="desktop",
+    )
     result = json.loads(
         bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent)
     )
     assert "error" in result
-    assert "Bot Chat" in result["error"]
+    assert "not available in this session" in result["error"]
+
+
+def test_tool_delivers_from_telegram_user_session(tmp_path, monkeypatch):
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(
+        home,
+        title="Project discussion",
+        platform="telegram",
+        gateway_session_key="agent:main:telegram:dm:test",
+    )
+    captured = {}
+
+    def _fake_start(argv, content, label, **kwargs):
+        captured.update(argv=argv, content=content, label=label, kwargs=kwargs)
+        return json.dumps({"status": "sent", "to": label})
+
+    monkeypatch.setattr(bot_mode_dm, "_start_delivery", _fake_start)
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(
+            target="researcher",
+            message="Review the release plan.",
+            agent=agent,
+        )
+    )
+
+    assert result == {"status": "sent", "to": "@researcher"}
+    assert captured["argv"][:4] == ["hermes", "-p", "researcher", "chat"]
+    assert captured["content"].endswith("Review the release plan.")
 
 
 def test_tool_refuses_on_unmanaged_install(tmp_path):
