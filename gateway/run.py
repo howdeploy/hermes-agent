@@ -42,6 +42,7 @@ import signal
 import threading
 import time
 import traceback
+import uuid
 from collections import OrderedDict
 from contextvars import Context, copy_context
 from pathlib import Path
@@ -8689,28 +8690,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         A Telegram DM/forum topic whose title starts with ``$`` (e.g.
         ``$writer``) is bound to that Bot Mode profile: every text message in the
         topic runs as a bot chain headed by the bound bot and the default
-        profile does not answer there. Returns None when the topic has no
-        ``$Name`` title or the named bot is missing/disabled/unconfigured.
+        profile does not answer there.
+
+        Returns None only when this is not a ``$Name`` bot topic at all. Once
+        the topic title begins with ``$`` the route identity is explicit, so
+        an unresolved/disabled/unconfigured/unreadable bot fails CLOSED by
+        raising ``BotTopicBindingError`` — the caller turns that into a
+        user-visible routing refusal and never routes the message to the
+        default agent.
         """
         if source.platform != Platform.TELEGRAM:
             return None
         topic_name = str(getattr(source, "chat_topic", "") or "").strip()
         if not topic_name.startswith("$"):
             return None
+
+        from agent.bot_chain import BotTopicBindingError
+
         candidate = topic_name[1:].strip()
         if not candidate:
-            return None
+            raise BotTopicBindingError(
+                f"Topic '{topic_name}' looks like a bot topic but names no bot. "
+                "Rename it to '$<bot-name>' or drop the '$' prefix. The "
+                "default agent does not answer in bound bot topics."
+            )
         try:
             from hermes_cli.bot_profiles import get_bot_profile
 
             profile = get_bot_profile(candidate)
-        except Exception:
+        except FileNotFoundError:
+            raise BotTopicBindingError(
+                f"Bot topic '{topic_name}' is bound to '${candidate}', but no "
+                f"profile with that name exists. Create it with: "
+                f"hermes bots create {candidate} ... — the default agent does "
+                "not answer in bound bot topics."
+            ) from None
+        except ValueError:
+            raise BotTopicBindingError(
+                f"Bot topic '{topic_name}' is bound to '${candidate}', which "
+                "is not a valid profile name. Rename the topic to "
+                "'$<bot-name>' (lowercase letters, digits, '-' or '_'). The "
+                "default agent does not answer in bound bot topics."
+            ) from None
+        except Exception as exc:
             logger.debug(
-                "topic-bot-binding: no runnable bot for topic '%s'", topic_name, exc_info=True
+                "topic-bot-binding: could not read profile for topic '%s'",
+                topic_name,
+                exc_info=True,
             )
-            return None
-        if not profile.enabled or not profile.provider or not profile.model:
-            return None
+            raise BotTopicBindingError(
+                f"Bot topic '{topic_name}' is bound to '${candidate}', but "
+                f"that profile cannot be read right now ({exc}). The default "
+                "agent does not answer in bound bot topics."
+            ) from None
+        if not profile.enabled:
+            raise BotTopicBindingError(
+                f"Bot topic '{topic_name}' is bound to '${profile.name}', but "
+                "that bot is disabled (or its profile metadata is unreadable, "
+                "which fails closed). Enable it with: "
+                f"hermes bots enable {profile.name} — the default agent does "
+                "not answer in bound bot topics."
+            )
+        if not profile.provider or not profile.model:
+            raise BotTopicBindingError(
+                f"Bot topic '{topic_name}' is bound to '${profile.name}', but "
+                "that bot has no model/provider configured. Run: "
+                f"hermes bots configure {profile.name} "
+                "--provider <provider> --model <model> — the default agent "
+                "does not answer in bound bot topics."
+            )
         return profile.name
 
     _TELEGRAM_LOBBY_REMINDER_COOLDOWN_S = 30.0
@@ -21278,8 +21326,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         routing_key: str,
         request,
     ) -> Optional[str]:
-        """Run and persist one ``$Bot`` chain under the gateway turn lease."""
+        """Run and persist one ``$Bot`` chain under the gateway turn lease.
+
+        Idempotent recipient processing for at-least-once platform delivery:
+        a durable admission receipt (SessionDB ``bot_chain_deliveries``) is
+        written BEFORE any model execution and decides whether this platform
+        message may start a chain. A redelivery after a crash or a failed
+        transcript write finds the receipt and never re-executes the chain.
+        """
         from agent.bot_chain import (
+            BOT_CHAIN_CONVERSATION_PREFIX,
             BotChainCancelled,
             BotChainControl,
             BotChainError,
@@ -21288,15 +21344,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         from hermes_cli.bot_profiles import resolve_bot_chain
 
-        if event.message_id and await self.async_session_store.has_platform_message_id(
-            session_entry.session_id, str(event.message_id)
-        ):
-            logger.info(
-                "Skipping duplicate bot-chain turn (message_id=%s) in session %s",
-                event.message_id,
-                session_entry.session_id,
+        message_id = str(event.message_id) if event.message_id else None
+        conversation_name: Optional[str] = None
+        if message_id:
+            # Legacy receipt: events processed before the admission table
+            # existed are deduped by their persisted transcript row.
+            if await self.async_session_store.has_platform_message_id(
+                session_entry.session_id, message_id
+            ):
+                logger.info(
+                    "Skipping duplicate bot-chain turn (message_id=%s) in session %s",
+                    message_id,
+                    session_entry.session_id,
+                )
+                return None
+            conversation_name = (
+                f"{BOT_CHAIN_CONVERSATION_PREFIX}{uuid.uuid4().hex}"
             )
-            return None
+            try:
+                admission = await self.async_session_store.admit_bot_chain_delivery(
+                    session_entry.session_id, message_id, conversation_name
+                )
+            except Exception:
+                # Fail closed: executing without a durable receipt would
+                # reopen the duplicate-execution window on redelivery.
+                logger.warning(
+                    "Bot-chain admission write failed (message_id=%s, session %s)",
+                    message_id,
+                    session_entry.session_id,
+                    exc_info=True,
+                )
+                return (
+                    "Bot chain is temporarily unavailable: the delivery "
+                    "receipt could not be persisted. Please resend the message."
+                )
+            if admission != "admitted":
+                logger.info(
+                    "Skipping %s bot-chain turn (message_id=%s) in session %s",
+                    admission,
+                    message_id,
+                    session_entry.session_id,
+                )
+                return None
+            try:
+                await self.async_session_store.mark_bot_chain_delivery_running(
+                    session_entry.session_id, message_id
+                )
+            except Exception:
+                # Best-effort marker only; the admission row already
+                # guarantees no second execution.
+                logger.debug(
+                    "bot-chain running marker failed (message_id=%s)",
+                    message_id,
+                    exc_info=True,
+                )
 
         control = BotChainControl()
         chain_state = self._session_state(routing_key)
@@ -21305,6 +21406,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         response: str
         cancelled = False
+        outcome = "completed"
         try:
             profiles = await asyncio.to_thread(resolve_bot_chain, request.names)
             result = await asyncio.to_thread(
@@ -21312,25 +21414,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 profiles,
                 request.prompt,
                 control=control,
+                conversation_name=conversation_name,
             )
             response = format_bot_chain_result(result)
         except BotChainCancelled:
             cancelled = True
+            outcome = "cancelled"
             response = "Bot chain stopped."
         except (BotChainError, FileNotFoundError, OSError, ValueError) as exc:
+            outcome = "failed"
             response = f"Bot chain failed: {exc}"
         except Exception as exc:
+            outcome = "failed"
             logger.exception("Unexpected bot-chain failure for session %s", routing_key)
             response = f"Bot chain failed: {exc}"
 
         timestamp = time.time()
+        if message_id:
+            # Settlement lands BEFORE the transcript rows and is never
+            # swallowed silently: it is the receipt that forbids a second
+            # execution when a later write fails and the platform redelivers.
+            try:
+                await self.async_session_store.settle_bot_chain_delivery(
+                    session_entry.session_id,
+                    message_id,
+                    outcome=outcome,
+                    detail=response[:500],
+                )
+            except Exception:
+                logger.warning(
+                    "Bot-chain settlement write failed (message_id=%s, session %s); "
+                    "a redelivery will reconcile the stale admission without "
+                    "re-executing the chain",
+                    message_id,
+                    session_entry.session_id,
+                    exc_info=True,
+                )
         user_entry = {
             "role": "user",
             "content": event.text or "",
             "timestamp": timestamp,
         }
-        if event.message_id:
-            user_entry["message_id"] = str(event.message_id)
+        if message_id:
+            user_entry["message_id"] = message_id
         try:
             await self.async_session_store.append_to_transcript(
                 session_entry.session_id,
@@ -21380,6 +21506,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             from agent.bot_chain import (
                 BotChainSyntaxError,
+                BotTopicBindingError,
                 bind_topic_bot,
                 parse_bot_chain_message,
             )
@@ -21393,10 +21520,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _bot_chain_syntax_error = exc
             # A Telegram topic titled ``$Name`` is bound to that Bot Mode profile:
             # the bound bot always answers there (plain messages included),
-            # and explicit ``$Other`` tokens are additional invited bots.
-            _bound_bot = await asyncio.to_thread(
-                self._telegram_topic_bound_bot, source
-            )
+            # and explicit ``$Other`` tokens are additional invited bots. Once
+            # the topic title starts with ``$`` the route identity is explicit,
+            # so an unresolvable binding fails closed with a user-visible
+            # refusal instead of falling through to the default agent.
+            try:
+                _bound_bot = await asyncio.to_thread(
+                    self._telegram_topic_bound_bot, source
+                )
+            except BotTopicBindingError as exc:
+                return str(exc)
             if _bound_bot is not None:
                 _bot_chain_request = bind_topic_bot(
                     _bot_chain_request, _bound_bot, _bot_chain_text

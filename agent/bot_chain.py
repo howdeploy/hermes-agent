@@ -48,6 +48,16 @@ class BotChainCancelled(BotChainError):
     """The operator stopped an active chain."""
 
 
+class BotTopicBindingError(BotChainError):
+    """A ``$Name`` Telegram topic requested a bot that cannot run.
+
+    Raised only once ``chat_topic`` provably starts with ``$``: at that
+    point the operator has explicitly bound the topic to a bot identity,
+    so the message must NOT fall through to the default agent. The message
+    is refused with this typed, user-visible error instead.
+    """
+
+
 class BotRuntimeUnavailable(BotChainError):
     """The primary RPC runtime failed before a bot turn was admitted.
 
@@ -1002,6 +1012,7 @@ class BotChainRunner:
         *,
         control: Optional[BotChainControl] = None,
         on_step: Optional[Callable[[BotChainStep, int, int], None]] = None,
+        conversation_name: Optional[str] = None,
     ) -> BotChainResult:
         ordered = list(profiles)
         if not ordered:
@@ -1010,7 +1021,13 @@ class BotChainRunner:
         if not original_prompt:
             raise BotChainSyntaxError(BOT_CHAIN_USAGE)
         control = control or BotChainControl()
-        conversation_name = f"{BOT_CHAIN_CONVERSATION_PREFIX}{uuid.uuid4().hex}"
+        if conversation_name is None:
+            conversation_name = f"{BOT_CHAIN_CONVERSATION_PREFIX}{uuid.uuid4().hex}"
+        elif not str(conversation_name).startswith(BOT_CHAIN_CONVERSATION_PREFIX):
+            raise ValueError(
+                "conversation_name must keep the "
+                f"{BOT_CHAIN_CONVERSATION_PREFIX!r} prefix"
+            )
 
         steps: list[BotChainStep] = []
         next_input = original_prompt

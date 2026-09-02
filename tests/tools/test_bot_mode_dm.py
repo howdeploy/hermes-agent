@@ -857,3 +857,21 @@ def test_dm_dir_rejects_precreated_symlink(tmp_path, monkeypatch):
 
     with pytest.raises(PermissionError, match="not a directory"):
         bot_mode_dm._dm_dir()
+
+
+def test_enabled_local_roster_fails_closed_on_unreadable_metadata(tmp_path):
+    """Corrupt profile.yaml excludes the profile from the message_agent
+    roster instead of silently widening execution authority."""
+    from tools import bot_mode_dm
+
+    home = tmp_path / ".hermes"
+    (home / "profiles" / "writer").mkdir(parents=True)
+    (home / "profiles" / "reviewer").mkdir(parents=True)
+    (home / "profiles" / "writer" / "profile.yaml").write_text(
+        "bot:\n  enabled: true\n", encoding="utf-8"
+    )
+    (home / "profiles" / "reviewer" / "profile.yaml").write_text(
+        "bot: [unclosed\n", encoding="utf-8"
+    )
+
+    assert bot_mode_dm._enabled_local_roster(home) == ["default", "writer"]

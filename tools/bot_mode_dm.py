@@ -204,9 +204,10 @@ def _enabled_local_roster(root: Path) -> list[str]:
             if not read_profile_meta(profile_dir).get("bot_enabled", True):
                 continue
         except Exception:
-            # Match the profile loader's fail-open metadata default. Delivery
-            # still validates that the resolved profile exists.
-            pass
+            # A metadata boundary that cannot be read authoritatively fails
+            # closed: unknown authority must not widen the callable roster.
+            # Delivery still validates that the resolved profile exists.
+            continue
         names.append(name)
     return names
 

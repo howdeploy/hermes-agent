@@ -15138,6 +15138,167 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return cursor.fetchone() is not None
 
     # =========================================================================
+    # Bot-chain inbound delivery admission (idempotent recipient processing)
+    # =========================================================================
+    #
+    # A ``$Bot`` chain triggered by a platform message executes model turns
+    # with durable side effects (isolated sessions, canonical Bot Chat
+    # history). At-least-once platform delivery must therefore meet an
+    # idempotent recipient: the admission row below is written BEFORE any
+    # model execution and is the single authority deciding whether a
+    # (re)delivered platform message may start a chain. States:
+    #
+    #   admitted  — receipt persisted, execution not started yet
+    #   running   — execution in flight (best-effort marker)
+    #   settled   — terminal; ``outcome`` binds the chain result
+    #               (completed | failed | cancelled | abandoned)
+    #
+    # A redelivery that finds ``admitted``/``running`` means the previous
+    # attempt died before settlement (or its settlement write failed); the
+    # row is reconciled to ``settled/abandoned`` WITHOUT re-executing the
+    # chain, because the side effects may already have happened.
+
+    _BOT_CHAIN_DELIVERIES_DDL = """
+        session_id TEXT NOT NULL,
+        platform_message_id TEXT NOT NULL,
+        chain_name TEXT NOT NULL,
+        state TEXT NOT NULL,
+        outcome TEXT,
+        detail TEXT,
+        admitted_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        PRIMARY KEY (session_id, platform_message_id)
+    """
+
+    def admit_bot_chain_delivery(
+        self,
+        session_id: str,
+        platform_message_id: str,
+        chain_name: str,
+    ) -> str:
+        """Durably admit an inbound bot-chain event, exactly once.
+
+        Returns one of:
+
+        * ``"admitted"`` — fresh receipt written; the caller MUST execute
+          the chain and later call :meth:`settle_bot_chain_delivery`.
+        * ``"settled"`` — this platform message already ran to settlement;
+          the caller must not execute anything.
+        * ``"reconciled"`` — a previous attempt never settled (crash or a
+          failed settlement write). The stale row is settled as
+          ``abandoned`` and the caller must not re-execute the chain.
+        """
+        now = time.time()
+
+        def _do(conn: sqlite3.Connection) -> str:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS bot_chain_deliveries ("
+                + self._BOT_CHAIN_DELIVERIES_DDL
+                + ")"
+            )
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO bot_chain_deliveries "
+                "(session_id, platform_message_id, chain_name, state, "
+                "admitted_at, updated_at) VALUES (?, ?, ?, 'admitted', ?, ?)",
+                (session_id, platform_message_id, chain_name, now, now),
+            )
+            if cursor.rowcount:
+                return "admitted"
+            row = conn.execute(
+                "SELECT state FROM bot_chain_deliveries "
+                "WHERE session_id = ? AND platform_message_id = ?",
+                (session_id, platform_message_id),
+            ).fetchone()
+            if row is not None and row[0] == "settled":
+                return "settled"
+            conn.execute(
+                "UPDATE bot_chain_deliveries SET state = 'settled', "
+                "outcome = 'abandoned', detail = ?, updated_at = ? "
+                "WHERE session_id = ? AND platform_message_id = ?",
+                (
+                    "Redelivered before the previous attempt settled; the "
+                    "chain is not re-executed so its side effects cannot "
+                    "happen twice.",
+                    now,
+                    session_id,
+                    platform_message_id,
+                ),
+            )
+            return "reconciled"
+
+        return self._execute_write(_do)
+
+    def mark_bot_chain_delivery_running(
+        self, session_id: str, platform_message_id: str
+    ) -> None:
+        """Best-effort admitted → running transition before execution."""
+
+        def _do(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE bot_chain_deliveries SET state = 'running', "
+                "updated_at = ? WHERE session_id = ? AND "
+                "platform_message_id = ? AND state = 'admitted'",
+                (time.time(), session_id, platform_message_id),
+            )
+
+        self._execute_write(_do)
+
+    def settle_bot_chain_delivery(
+        self,
+        session_id: str,
+        platform_message_id: str,
+        *,
+        outcome: str,
+        detail: str = "",
+    ) -> None:
+        """Bind the terminal chain outcome to the admission receipt.
+
+        Unconditional last-writer-wins: when a redelivery reconciled a stale
+        attempt to ``abandoned`` while the original execution was still in
+        flight, the real execution's settlement overwrites it with the
+        truthful outcome.
+        """
+
+        def _do(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE bot_chain_deliveries SET state = 'settled', "
+                "outcome = ?, detail = ?, updated_at = ? "
+                "WHERE session_id = ? AND platform_message_id = ?",
+                (outcome, detail, time.time(), session_id, platform_message_id),
+            )
+
+        self._execute_write(_do)
+
+    def get_bot_chain_delivery(
+        self, session_id: str, platform_message_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the admission row as a dict (or None). Diagnostic/tests."""
+        with self._read_ctx() as conn:
+            try:
+                row = conn.execute(
+                    "SELECT session_id, platform_message_id, chain_name, "
+                    "state, outcome, detail, admitted_at, updated_at "
+                    "FROM bot_chain_deliveries "
+                    "WHERE session_id = ? AND platform_message_id = ?",
+                    (session_id, platform_message_id),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                # Table not created yet: no admission ever recorded.
+                return None
+        if row is None:
+            return None
+        return {
+            "session_id": row[0],
+            "platform_message_id": row[1],
+            "chain_name": row[2],
+            "state": row[3],
+            "outcome": row[4],
+            "detail": row[5],
+            "admitted_at": row[6],
+            "updated_at": row[7],
+        }
+
+    # =========================================================================
     # Export and cleanup
     # =========================================================================
 

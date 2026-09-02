@@ -184,13 +184,17 @@ def _roster_lines(root: Path, me: str) -> list[str]:
 
 
 def _is_bot_enabled(profile_dir: Path) -> bool:
-    """Return the Bot Mode execution flag, defaulting to enabled."""
+    """Return the Bot Mode execution flag.
+
+    Legacy profiles without bot metadata default to enabled; a metadata
+    file that cannot be read authoritatively fails closed.
+    """
     try:
         from hermes_cli.profiles import read_profile_meta
 
         return bool(read_profile_meta(profile_dir).get("bot_enabled", True))
     except Exception:
-        return True
+        return False
 
 
 def _user_surface_roster_lines(root: Path, me: str) -> list[str]:

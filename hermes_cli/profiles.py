@@ -945,37 +945,53 @@ def read_profile_meta(profile_dir: Path) -> dict:
 
     Returns ``{"description": "", "description_auto": False,
     "display_name": "", "bot_enabled": True}`` when the file is missing
-    or unreadable. Never
-    raises — a corrupt profile.yaml on an unrelated profile must not
-    break ``hermes profile list``.
+    entirely: legacy profiles predate the bot metadata boundary, so the
+    compatibility default keeps them callable.
+
+    A file that EXISTS but cannot be read authoritatively — I/O error,
+    malformed YAML, a non-mapping document, or a non-mapping ``bot:``
+    section — fails CLOSED instead (``bot_enabled`` False): the system can
+    no longer know whether the operator set ``bot.enabled: false``, and an
+    unreadable metadata boundary must not silently widen execution
+    authority. Never raises — a corrupt profile.yaml on an unrelated
+    profile must not break ``hermes profile list``.
     """
-    empty = {
+    base = {
         "description": "",
         "description_auto": False,
         "display_name": "",
-        "bot_enabled": True,
     }
+    legacy = {**base, "bot_enabled": True}
+    unreadable = {**base, "bot_enabled": False}
     path = _profile_yaml_path(profile_dir)
     if not path.is_file():
-        return empty
+        return legacy
     try:
         import yaml
         with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            data = yaml.safe_load(f)
     except Exception:
-        return empty
+        return unreadable
+    if data is None:
+        # A readable but empty file carries no bot metadata: legacy default.
+        return legacy
     if not isinstance(data, dict):
-        return empty
+        return unreadable
     bot_meta = data.get("bot")
+    if bot_meta is None:
+        # No bot section written: legacy compatibility default.
+        bot_enabled = True
+    elif isinstance(bot_meta, dict):
+        bot_enabled = bool(bot_meta.get("enabled", True))
+    else:
+        # The operator wrote a bot section, but it is not a mapping: the
+        # intended flag cannot be read authoritatively, so fail closed.
+        bot_enabled = False
     return {
         "description": str(data.get("description") or "").strip(),
         "description_auto": bool(data.get("description_auto", False)),
         "display_name": str(data.get("display_name") or "").strip(),
-        "bot_enabled": (
-            bool(bot_meta.get("enabled", True))
-            if isinstance(bot_meta, dict)
-            else True
-        ),
+        "bot_enabled": bot_enabled,
     }
 
 

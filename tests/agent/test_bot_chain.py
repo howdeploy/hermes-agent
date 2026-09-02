@@ -731,3 +731,34 @@ def test_local_delivery_default_remains_canonical_bot_chat():
     argv = local_delivery_command("test1", "/tmp/query.txt")
 
     assert argv[argv.index("-c") + 1] == "Bot Chat"
+
+
+def test_runner_accepts_caller_supplied_conversation_name():
+    """The gateway binds the durable admission receipt to the chain identity,
+    so the runner must execute under the exact caller-supplied name."""
+    calls = []
+
+    def execute(profile, prompt, control, *, conversation_name):
+        calls.append(conversation_name)
+        return "ok"
+
+    result = BotChainRunner(turn_executor=execute).run(
+        [_profile("first")],
+        "task",
+        conversation_name="Bot Chain deadbeef",
+    )
+
+    assert calls == ["Bot Chain deadbeef"]
+    assert result.final_output == "ok"
+
+
+def test_runner_rejects_conversation_name_without_chain_prefix():
+    def execute(profile, prompt, control, *, conversation_name):
+        raise AssertionError("must not execute")
+
+    with pytest.raises(ValueError, match="prefix"):
+        BotChainRunner(turn_executor=execute).run(
+            [_profile("first")],
+            "task",
+            conversation_name="Bot Chat",
+        )

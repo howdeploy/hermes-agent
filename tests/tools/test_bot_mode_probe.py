@@ -364,3 +364,20 @@ def test_fingerprint_changes_when_a_peer_is_registered(tmp_path):
     )
     after = bot_mode_probe.capability_fingerprint(home)
     assert before != after
+
+
+def test_user_surface_omits_unreadable_metadata_teammate(tmp_path):
+    """A corrupt profile.yaml fails closed: unknown authority never widens
+    the callable roster (#100758 review, blocker 2)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    enabled = _make_bot_profile(home, "writer", managed=False)
+    (enabled / "profile.yaml").write_text("bot:\n  enabled: true\n", encoding="utf-8")
+    corrupt = _make_bot_profile(home, "reviewer", managed=False)
+    (corrupt / "profile.yaml").write_text("bot: [unclosed\n", encoding="utf-8")
+
+    section = bot_mode_probe.get_bot_mode_user_protocol_section(home)
+
+    assert "`@writer`" in section
+    assert "`@reviewer`" not in section
+    assert bot_mode_probe._is_bot_enabled(corrupt) is False

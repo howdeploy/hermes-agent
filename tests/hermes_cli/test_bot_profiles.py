@@ -121,3 +121,57 @@ def test_remove_requires_explicit_confirmation(bot_home):
     with pytest.raises(ValueError, match="without --yes"):
         remove_bot_profile("worker")
     assert get_bot_profile("worker").name == "worker"
+
+
+# ---------------------------------------------------- bot_enabled authority
+
+
+def _write_bot(home, name, *, profile_yaml=None):
+    profile_dir = home / "profiles" / name
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text(
+        yaml.safe_dump({"model": {"provider": "nous", "default": "m/1"}}),
+        encoding="utf-8",
+    )
+    if profile_yaml is not None:
+        (profile_dir / "profile.yaml").write_text(profile_yaml, encoding="utf-8")
+    return profile_dir
+
+
+def test_read_profile_meta_missing_file_keeps_legacy_default(bot_home):
+    profile_dir = _write_bot(bot_home, "legacy")
+    assert profiles_mod.read_profile_meta(profile_dir)["bot_enabled"] is True
+
+
+def test_read_profile_meta_corrupt_yaml_fails_closed(bot_home):
+    profile_dir = _write_bot(bot_home, "broken", profile_yaml="bot: [unclosed\n")
+    assert profiles_mod.read_profile_meta(profile_dir)["bot_enabled"] is False
+
+
+def test_read_profile_meta_non_mapping_document_fails_closed(bot_home):
+    profile_dir = _write_bot(bot_home, "listdoc", profile_yaml="- a\n- b\n")
+    assert profiles_mod.read_profile_meta(profile_dir)["bot_enabled"] is False
+
+
+def test_read_profile_meta_non_mapping_bot_section_fails_closed(bot_home):
+    profile_dir = _write_bot(bot_home, "weirdbot", profile_yaml="bot: 42\n")
+    assert profiles_mod.read_profile_meta(profile_dir)["bot_enabled"] is False
+
+
+def test_read_profile_meta_explicit_flag_is_authoritative(bot_home):
+    off = _write_bot(bot_home, "off", profile_yaml="bot:\n  enabled: false\n")
+    on = _write_bot(bot_home, "on", profile_yaml="bot:\n  enabled: true\n")
+    assert profiles_mod.read_profile_meta(off)["bot_enabled"] is False
+    assert profiles_mod.read_profile_meta(on)["bot_enabled"] is True
+
+
+def test_resolve_bot_chain_refuses_corrupt_metadata_profile(bot_home):
+    """A previously disabled/indeterminate profile must not become callable
+    because its metadata file cannot be parsed."""
+    _write_bot(bot_home, "worker")
+    _write_bot(bot_home, "broken", profile_yaml="bot: [unclosed\n")
+
+    assert get_bot_profile("worker").enabled is True
+    assert get_bot_profile("broken").enabled is False
+    with pytest.raises(ValueError, match="disabled"):
+        resolve_bot_chain(["worker", "broken"])

@@ -4337,6 +4337,45 @@ class SessionStore:
             logger.debug("has_platform_message_id lookup failed", exc_info=True)
             return False
 
+    def admit_bot_chain_delivery(
+        self, session_id: str, platform_message_id: str, chain_name: str
+    ) -> str:
+        """Durably admit an inbound bot-chain event; see SessionDB.
+
+        Returns ``"admitted"`` / ``"settled"`` / ``"reconciled"``. Unlike the
+        read-only dedupe probe above, errors PROPAGATE: when the receipt
+        cannot be persisted the caller must refuse to execute, because
+        running the chain without a durable admission row would reopen the
+        duplicate-execution window on redelivery. With no DB at all
+        (in-memory sessions) there is nothing to persist and the caller
+        proceeds without dedupe, matching pre-admission behavior.
+        """
+        db = self._db_for_session_id(session_id)
+        if db is None:
+            return "admitted"
+        return db.admit_bot_chain_delivery(session_id, platform_message_id, chain_name)
+
+    def mark_bot_chain_delivery_running(
+        self, session_id: str, platform_message_id: str
+    ) -> None:
+        db = self._db_for_session_id(session_id)
+        if db is not None:
+            db.mark_bot_chain_delivery_running(session_id, platform_message_id)
+
+    def settle_bot_chain_delivery(
+        self,
+        session_id: str,
+        platform_message_id: str,
+        *,
+        outcome: str,
+        detail: str = "",
+    ) -> None:
+        db = self._db_for_session_id(session_id)
+        if db is not None:
+            db.settle_bot_chain_delivery(
+                session_id, platform_message_id, outcome=outcome, detail=detail
+            )
+
     def rewrite_transcript(
         self,
         session_id: str,
