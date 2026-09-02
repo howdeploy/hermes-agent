@@ -19597,7 +19597,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
                 )
             if (
-                getattr(running_agent, "_is_bot_chain_control", False)
+                getattr(running_agent, "_is_bot_chain_control", False) is True
                 and effective_busy_input_mode == "interrupt"
             ):
                 # A chain has no live parent AIAgent that can absorb redirect

@@ -18850,7 +18850,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self._agent_running
                     and not has_images
                     and text.strip().lower() == "/stop"
-                    and getattr(self.agent, "_is_bot_chain_control", False)
+                    and getattr(self.agent, "_is_bot_chain_control", False) is True
                 ):
                     request_hard_interrupt(self.agent, "/stop")
                     _cprint("  Stopping bot chain...")
