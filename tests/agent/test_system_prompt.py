@@ -155,7 +155,11 @@ def test_telegram_user_session_gets_bot_mode_message_agent_guidance(
 
     assert "This session can use Bot Mode" in prompt
     assert "message_agent directly" in prompt
-    assert "`@researcher`" in prompt
+    # Telegram renders teammates with the inert $ sigil: @word would resolve
+    # to a real Telegram username in the bot's visible replies (#100758).
+    assert "`$researcher`" in prompt
+    assert "`@researcher`" not in prompt
+    assert "NEVER write @-handles" in prompt
     assert "Capability epoch:" in prompt
 
 

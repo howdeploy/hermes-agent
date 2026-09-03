@@ -296,7 +296,10 @@ def message_agent_tool(
             "Send the essentials; share large content as a file path instead."
         )
 
-    raw_target = str(target or "").strip().lstrip("@")
+    # Both mention sigils are accepted: `@name` is the canonical Bot Mode
+    # form, `$name` is the Telegram-safe alias the user-surface protocol
+    # teaches on Telegram sessions (where @-handles resolve to real users).
+    raw_target = str(target or "").strip().lstrip("@$")
     if not raw_target:
         return _err("target is required.", roster=teammates, peers=peers)
 

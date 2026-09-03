@@ -381,3 +381,46 @@ def test_user_surface_omits_unreadable_metadata_teammate(tmp_path):
     assert "`@writer`" in section
     assert "`@reviewer`" not in section
     assert bot_mode_probe._is_bot_enabled(corrupt) is False
+
+
+def test_user_surface_telegram_uses_dollar_sigil(tmp_path):
+    """Telegram sessions must never be taught @-handles: Telegram resolves
+    @word as a REAL username (possibly a stranger's), so the user-visible
+    sigil there is the inert $ (#100758 live-test feedback)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _make_bot_profile(home, "researcher", managed=False)
+
+    section = bot_mode_probe.get_bot_mode_user_protocol_section(
+        home, platform="telegram"
+    )
+
+    assert section.startswith("## Bot Mode: messaging other agents")
+    assert "`$researcher`" in section
+    assert "`@researcher`" not in section
+    assert "NEVER write @-handles" in section
+    assert "Telegram resolves @word as a REAL username" in section
+    assert "message_agent tool accepts the same $name form" in section
+
+
+def test_user_surface_platform_variants_cached_separately(tmp_path):
+    """One gateway process serves CLI and Telegram sessions at once; their
+    prompt sections differ by sigil and must not share a cache slot."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _make_bot_profile(home, "researcher", managed=False)
+
+    cli_section = bot_mode_probe.get_bot_mode_user_protocol_section(home)
+    tg_section = bot_mode_probe.get_bot_mode_user_protocol_section(
+        home, platform="telegram"
+    )
+
+    assert "`@researcher`" in cli_section
+    assert "NEVER write @-handles" not in cli_section
+    assert "`$researcher`" in tg_section
+    # Repeat calls return their own cached variants unchanged.
+    assert bot_mode_probe.get_bot_mode_user_protocol_section(home) == cli_section
+    assert (
+        bot_mode_probe.get_bot_mode_user_protocol_section(home, platform="Telegram")
+        == tg_section
+    )

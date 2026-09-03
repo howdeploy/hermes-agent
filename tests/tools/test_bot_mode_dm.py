@@ -875,3 +875,21 @@ def test_enabled_local_roster_fails_closed_on_unreadable_metadata(tmp_path):
     )
 
     assert bot_mode_dm._enabled_local_roster(home) == ["default", "writer"]
+
+
+def test_local_delivery_accepts_dollar_sigil_target(tmp_path, monkeypatch):
+    """$name is the Telegram-safe teammate alias taught on Telegram sessions;
+    the tool must resolve it exactly like the canonical @name (#100758)."""
+    calls = _capture_spawn(monkeypatch)
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    agent = _FakeAgent(home, title="Bot Chat")
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(target="$researcher", message="hi", agent=agent)
+    )
+
+    assert result["status"] == "sent"
+    assert result["to"] == "@researcher"
+    assert len(calls) == 1
+    _mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
+    assert transport_argv[:3] == ["hermes", "-p", "researcher"]

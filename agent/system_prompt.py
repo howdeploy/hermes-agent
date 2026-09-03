@@ -747,7 +747,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 _bot_section = (
                     get_bot_mode_protocol_section(_bot_home)
                     if _bot_mode_session_kind == "bot_chat"
-                    else get_bot_mode_user_protocol_section(_bot_home)
+                    # Telegram renders teammate handles with the inert $
+                    # sigil — @word would resolve to a real Telegram
+                    # username in the bot's visible replies.
+                    else get_bot_mode_user_protocol_section(
+                        _bot_home,
+                        platform=str(getattr(agent, "platform", "") or ""),
+                    )
                 )
                 if _bot_section:
                     post_workspace_parts.append(_bot_section)

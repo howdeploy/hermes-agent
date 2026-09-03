@@ -197,15 +197,27 @@ def _is_bot_enabled(profile_dir: Path) -> bool:
         return False
 
 
-def _user_surface_roster_lines(root: Path, me: str) -> list[str]:
+def _sigil(telegram: bool) -> str:
+    """Mention sigil for user-visible teammate handles.
+
+    ``@`` is the canonical Bot Mode form. On Telegram it is unsafe: Telegram
+    resolves ``@word`` as a real username (possibly a stranger's/scam one) and
+    unsolicited mentions can get the bot restricted, so Telegram sessions get
+    the inert ``$`` alias instead.
+    """
+    return "$" if telegram else "@"
+
+
+def _user_surface_roster_lines(root: Path, me: str, *, telegram: bool = False) -> list[str]:
     """Enabled Bot Mode teammates exposed to CLI/Telegram user sessions."""
     lines = []
+    sigil = _sigil(telegram)
     for name, profile_dir in _roster(root):
         if name == me or not _is_bot_enabled(profile_dir):
             continue
         role = _profile_role(profile_dir)
         handle = _handle(name)
-        lines.append(f"- `@{handle}`" + (f" — {role}" if role else ""))
+        lines.append(f"- `{sigil}{handle}`" + (f" — {role}" if role else ""))
     return lines
 
 
@@ -233,7 +245,7 @@ def _peers(root: Path) -> list[str]:
         return []
 
 
-def _remote_paragraph(root: Path) -> str:
+def _remote_paragraph(root: Path, *, telegram: bool = False) -> str:
     """Protocol addendum for agents on OTHER connected machines.
 
     Fed by the Desktop relay roster (``tools/bot_relay.py``) — every gateway
@@ -250,12 +262,13 @@ def _remote_paragraph(root: Path) -> str:
         return ""
     if not roster:
         return ""
+    sigil = _sigil(telegram)
     lines = []
     for row, form in zip(roster, remote_target_forms(roster)):
         where = row["connection_label"] or row["connection_id"]
         role = " — ".join(p for p in (row["title"], row["description"]) if p)
         lines.append(
-            f"- `@{form}` — on {where}" + (f" — {role}" if role else "")
+            f"- `{sigil}{form}` — on {where}" + (f" — {role}" if role else "")
         )
     return (
         "\n\nTeammates on OTHER connected machines (reachable through the "
@@ -326,8 +339,9 @@ def _build_section(home: Path) -> str:
     )
 
 
-def _build_user_surface_section(home: Path) -> str:
+def _build_user_surface_section(home: Path, platform: str = "") -> str:
     """Bot Mode protocol for interactive CLI and Telegram user chats."""
+    telegram = "telegram" in str(platform or "").strip().lower()
     root = _hermes_root(home)
     me = _profile_name(home)
     my_dir = home if me == "default" else root / "profiles" / me
@@ -338,11 +352,22 @@ def _build_user_surface_section(home: Path) -> str:
     if _soul_has_user_protocol(my_dir):
         return ""
 
-    roster_lines = _user_surface_roster_lines(root, me)
+    roster_lines = _user_surface_roster_lines(root, me, telegram=telegram)
     if not roster_lines:
         return ""
     handle = _handle(me)
+    sigil = _sigil(telegram)
     roster_block = "\n".join(roster_lines)
+    telegram_rule = (
+        " This chat is on Telegram: NEVER write @-handles in your visible "
+        "replies. Telegram resolves @word as a REAL username — it may belong "
+        "to a stranger or a scam account, and unsolicited mentions can get "
+        "the bot restricted. Refer to teammates as $name in text (e.g. "
+        "`$hermes`); the message_agent tool accepts the same $name form as "
+        "its target."
+        if telegram
+        else ""
+    )
     return (
         f"{_USER_PROTOCOL_HEADING}\n"
         "This session can use Bot Mode: named Hermes profiles are agent "
@@ -358,11 +383,12 @@ def _build_user_surface_section(home: Path) -> str:
         "...\", or otherwise asks to involve a named teammate, call "
         "message_agent directly; do not ask the user to retype special syntax. "
         "Message ONE clearly relevant teammate; don't fan out to several "
-        "unless the user explicitly asked.\n"
-        f"You are `@{handle}`. Your Bot Mode teammates (live roster; roles "
+        "unless the user explicitly asked."
+        f"{telegram_rule}\n"
+        f"You are `{sigil}{handle}`. Your Bot Mode teammates (live roster; roles "
         "from their profiles):\n"
         f"{roster_block}"
-        + _remote_paragraph(root)
+        + _remote_paragraph(root, telegram=telegram)
         + _peer_paragraph(root)
     )
 
@@ -388,20 +414,29 @@ def get_bot_mode_user_protocol_section(
     home: str | os.PathLike | None = None,
     *,
     force_refresh: bool = False,
+    platform: str = "",
 ) -> str:
-    """Cached Bot Mode protocol for interactive CLI/Telegram sessions."""
+    """Cached Bot Mode protocol for interactive CLI/Telegram sessions.
+
+    ``platform`` selects the mention sigil: Telegram sessions get the inert
+    ``$`` form because Telegram resolves ``@word`` as a real username. The
+    cache is keyed per surface variant so a gateway process serving both CLI
+    and Telegram sessions never mixes them.
+    """
     resolved = str(home) if home else (
         os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
     )
+    telegram = "telegram" in str(platform or "").strip().lower()
+    cache_key = f"{resolved}\ttelegram" if telegram else resolved
     with _lock:
-        if force_refresh or resolved not in _user_surface_cached:
+        if force_refresh or cache_key not in _user_surface_cached:
             try:
-                _user_surface_cached[resolved] = _build_user_surface_section(
-                    Path(resolved)
+                _user_surface_cached[cache_key] = _build_user_surface_section(
+                    Path(resolved), platform=platform
                 )
             except Exception:
-                _user_surface_cached[resolved] = ""
-        return _user_surface_cached[resolved]
+                _user_surface_cached[cache_key] = ""
+        return _user_surface_cached[cache_key]
 
 
 # ── capability epoch ─────────────────────────────────────────────────────────
