@@ -658,7 +658,7 @@ def publish_bot_chain_history(
     without a duplicate write and makes the Bots row immediately resolvable by
     its exact-title registry key.
     """
-    from hermes_state import get_shared_session_db, release_or_close
+    from hermes_state import SessionDB, get_shared_session_db, release_or_close
     from tools.bot_mode_probe import BOT_CHAT_TITLE
     from tools.bot_relay import acquire_turn_lock, turn_wait_seconds
 
@@ -685,6 +685,18 @@ def publish_bot_chain_history(
 
             canonical = db.get_session_by_title(BOT_CHAT_TITLE)
             if canonical is None:
+                # The rename retires the chain-titled session, so the exact
+                # chain identity must survive on the message rows themselves:
+                # recovery from Bot Chat is keyed by that receipt, never by
+                # prompt text.
+                stamped_rows = db.get_messages_as_conversation(
+                    source_tip_id,
+                    repair_alternation=False,
+                    include_row_ids=True,
+                )
+                db.stamp_bot_chain_receipt(
+                    [m.get("_row_id") for m in stamped_rows], title
+                )
                 try:
                     promoted = db.set_session_title(source_root_id, BOT_CHAT_TITLE)
                 except ValueError:
@@ -732,6 +744,16 @@ def publish_bot_chain_history(
                 # likewise source-local and must not suppress the fresh insert.
                 copied.pop("_row_id", None)
                 copied.pop("_db_persisted", None)
+                # Chain-qualified receipt: recovery from Bot Chat may skip
+                # re-execution only for this exact chain identity, never for
+                # a mere prompt-text match.
+                receipt_meta = copied.get("display_metadata")
+                if not isinstance(receipt_meta, dict):
+                    receipt_meta = {}
+                copied["display_metadata"] = {
+                    **receipt_meta,
+                    SessionDB.BOT_CHAIN_RECEIPT_METADATA_KEY: {"chain": title},
+                }
                 copied_messages.append(copied)
 
             canonical_tip_id = (
@@ -1008,36 +1030,46 @@ def _last_assistant_text(messages: Sequence[Mapping[str, Any]]) -> Optional[str]
     return None
 
 
-def _output_after_prompt(
-    messages: Sequence[Mapping[str, Any]], prompt: str
+def _receipt_stamped_output(
+    messages: Sequence[Mapping[str, Any]], conversation_name: str
 ) -> Optional[str]:
-    """Assistant reply following the first exact user-prompt match."""
-    want = str(prompt or "")
-    for index, message in enumerate(messages):
-        if message.get("role") != "user" or str(message.get("content") or "") != want:
+    """Latest assistant reply carrying this exact chain identity's receipt."""
+    from hermes_state import SessionDB
+
+    receipt_key = SessionDB.BOT_CHAIN_RECEIPT_METADATA_KEY
+    for message in reversed(messages):
+        if message.get("role") != "assistant":
             continue
-        for followup in messages[index + 1 :]:
-            if followup.get("role") == "assistant":
-                content = str(followup.get("content") or "")
-                if content.strip():
-                    return content
-        return None
+        metadata = message.get("display_metadata")
+        if not isinstance(metadata, dict):
+            continue
+        receipt = metadata.get(receipt_key)
+        if not isinstance(receipt, dict):
+            continue
+        if receipt.get("chain") != conversation_name:
+            continue
+        content = str(message.get("content") or "")
+        if content.strip():
+            return content
     return None
 
 
 def recover_durable_step_output(
-    profile: BotProfile, conversation_name: str, input_text: str
+    profile: BotProfile, conversation_name: str
 ) -> Optional[str]:
     """Recover one chain step's output from the profile's durable state.
 
     The chain identity (``conversation_name``) is the idempotency key: a
     crash after a step's model turn persisted but before the next side
     effect must resume AFTER that step, never re-execute it. Two durable
-    shapes exist: the isolated chain session that kept its title (the
-    append-publish path), and the matching user/assistant pair inside the
-    canonical Bot Chat for a first turn whose session was promoted (the
-    rename-publish path). Returns ``None`` when no durable proof exists and
-    on any probe failure — recovery must never block a legitimate run.
+    shapes prove that identity: the isolated chain session that kept its
+    title (the append-publish path), and message rows stamped with the
+    chain receipt inside the canonical Bot Chat (the rename-publish path
+    retires the chain title, so the receipt rides on the promoted/copied
+    rows). Recovery NEVER matches on prompt text: a brand-new chain that
+    repeats an older prompt must execute its own model turn. Returns
+    ``None`` when no durable proof exists and on any probe failure —
+    recovery must never block a legitimate run.
     """
     from hermes_state import SessionDB
     from tools.bot_mode_probe import BOT_CHAT_TITLE
@@ -1057,9 +1089,11 @@ def recover_durable_step_output(
                 return recovered
         canonical = db.get_session_by_title(BOT_CHAT_TITLE)
         if canonical is not None and canonical.get("id"):
-            return _output_after_prompt(
-                db.get_messages_as_conversation(str(canonical["id"])),
-                input_text,
+            canonical_id = str(canonical["id"])
+            canonical_tip = db.get_compression_tip(canonical_id) or canonical_id
+            return _receipt_stamped_output(
+                db.get_messages_as_conversation(canonical_tip),
+                conversation_name,
             )
         return None
     except Exception:
@@ -1118,9 +1152,11 @@ class BotChainRunner:
             # identity already has a durable completed turn for this profile,
             # recover its output instead of re-executing — a redelivery after
             # a crash resumes after the last durable side effect, and the
-            # canonical-history projection is never published twice.
+            # canonical-history projection is never published twice. Recovery
+            # is keyed by the chain identity only (session title or the
+            # stamped chain receipt), never by prompt text.
             recovered = recover_durable_step_output(
-                profile, conversation_name, next_input
+                profile, conversation_name
             )
             if recovered is not None:
                 output = recovered

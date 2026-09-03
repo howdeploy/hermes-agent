@@ -610,6 +610,84 @@ def test_runner_recovers_completed_exact_turn_without_reexecution_or_republish(
         db.close()
 
 
+@pytest.mark.parametrize("canonical_exists", [False, True])
+def test_runner_executes_fresh_chain_when_prompt_repeats_older_bot_chat_turn(
+    tmp_path, canonical_exists
+):
+    """Chain identity, never prompt text, is the idempotency key.
+
+    Bot Chat already holds an older chain's user/assistant pair for the
+    exact same prompt. A fresh chain with a new conversation_name must
+    execute its own model turn instead of recovering the stale answer,
+    while a redelivery of the original identity still recovers without
+    re-executing.
+    """
+    profile = _temp_profile(tmp_path, "worker")
+    if canonical_exists:
+        db = SessionDB(Path(profile.path) / "state.db")
+        try:
+            db.create_session(
+                "canonical",
+                source="desktop",
+                model=profile.model,
+                profile_name=profile.name,
+            )
+            db.set_session_title("canonical", "Bot Chat")
+            db.set_session_hidden("canonical", True)
+        finally:
+            db.close()
+
+    calls = []
+
+    def execute(profile, prompt, control, *, conversation_name):
+        calls.append(conversation_name)
+        output = f"answer from {conversation_name}"
+        _persist_and_publish_turn(
+            profile,
+            conversation_name,
+            prompt,
+            output,
+            session_id=f"turn-{len(calls)}",
+        )
+        return output
+
+    runner = BotChainRunner(turn_executor=execute)
+    old = runner.run([profile], "do the task", conversation_name="Bot Chain old")
+    fresh = runner.run([profile], "do the task", conversation_name="Bot Chain new")
+
+    assert old.final_output == "answer from Bot Chain old"
+    assert fresh.final_output == "answer from Bot Chain new"
+    assert calls == ["Bot Chain old", "Bot Chain new"]
+
+    redelivered = runner.run(
+        [profile], "do the task", conversation_name="Bot Chain old"
+    )
+    assert redelivered.final_output == "answer from Bot Chain old"
+    assert calls == ["Bot Chain old", "Bot Chain new"]
+
+    db = SessionDB(Path(profile.path) / "state.db")
+    try:
+        canonical = db.get_session_by_title("Bot Chat")
+        assert canonical is not None
+        assert [
+            (
+                message["role"],
+                message["content"],
+                (message.get("display_metadata") or {})
+                .get("bot_chain", {})
+                .get("chain"),
+            )
+            for message in db.get_messages_as_conversation(canonical["id"])
+        ] == [
+            ("user", "do the task", "Bot Chain old"),
+            ("assistant", "answer from Bot Chain old", "Bot Chain old"),
+            ("user", "do the task", "Bot Chain new"),
+            ("assistant", "answer from Bot Chain new", "Bot Chain new"),
+        ]
+    finally:
+        db.close()
+
+
 def test_runner_resumes_multibot_chain_after_last_durable_step(tmp_path):
     """A crash before the next side effect resumes after, not before, it."""
 

@@ -58,7 +58,7 @@ from hermes_startup_watchdog import report_startup_progress
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, TypeVar, cast
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, TypeVar, cast
 
 import hermes_state_holders as _state_holders
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
@@ -12963,6 +12963,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return True
 
         return bool(self._execute_write(_do))
+
+    #: Key under which a bot-chain receipt lives inside ``display_metadata``.
+    #: The receipt is the durable, chain-qualified proof that a canonical
+    #: Bot Chat turn came from one exact chain identity
+    #: (``{"bot_chain": {"chain": <conversation_name>}}``). Recovery may
+    #: skip re-execution only on this identity match, never on prompt text.
+    BOT_CHAIN_RECEIPT_METADATA_KEY = "bot_chain"
+
+    def stamp_bot_chain_receipt(
+        self, message_row_ids: Sequence[int], chain_name: str
+    ) -> int:
+        """Merge a bot-chain receipt into each listed row's display_metadata.
+
+        Used when an isolated chain session is promoted (renamed) into the
+        canonical Bot Chat: the rename retitles the session, so the exact
+        chain identity has to survive on the message rows themselves.
+        Returns the number of rows stamped.
+        """
+        ids = [int(row_id) for row_id in message_row_ids if row_id is not None]
+        chain_name = str(chain_name or "").strip()
+        if not ids or not chain_name:
+            return 0
+        receipt_json = json.dumps({"chain": chain_name})
+
+        def _do(conn):
+            cursor = conn.executemany(
+                "UPDATE messages SET display_metadata = json_set("
+                "COALESCE(NULLIF(display_metadata, ''), '{}'), "
+                "'$.bot_chain', json(?)) WHERE id = ?",
+                [(receipt_json, row_id) for row_id in ids],
+            )
+            return cursor.rowcount
+
+        return int(self._execute_write(_do))
 
     #: Key under which message reactions live inside ``display_metadata``.
     #: Reactions share the existing per-message JSON column rather than a side
