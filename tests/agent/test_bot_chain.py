@@ -25,6 +25,7 @@ from agent.bot_chain import (
     publish_bot_chain_history,
 )
 from hermes_cli.bot_profiles import BotProfile
+from hermes_state import SessionDB
 
 
 def _profile(name: str) -> BotProfile:
@@ -35,6 +36,49 @@ def _profile(name: str) -> BotProfile:
         provider="test",
         system_prompt=f"You are {name}",
     )
+
+
+def _temp_profile(tmp_path: Path, name: str) -> BotProfile:
+    profile_home = tmp_path / ".hermes" / "profiles" / name
+    profile_home.mkdir(parents=True, exist_ok=True)
+    return BotProfile(
+        name=name,
+        path=profile_home,
+        model=f"model-{name}",
+        provider="test",
+        system_prompt=f"You are {name}",
+    )
+
+
+def _persist_and_publish_turn(
+    profile: BotProfile,
+    conversation_name: str,
+    prompt: str,
+    output: str,
+    *,
+    session_id: str,
+) -> None:
+    db = SessionDB(Path(profile.path) / "state.db")
+    try:
+        db.create_session(
+            session_id,
+            source="cli",
+            model=profile.model,
+            model_config={"follow_profile_config": True},
+            profile_name=profile.name,
+        )
+        db.set_session_title(session_id, conversation_name)
+        db.set_session_hidden(session_id, True)
+        db.append_messages_batch(
+            session_id,
+            [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": output},
+            ],
+        )
+    finally:
+        db.close()
+    publish_bot_chain_history(profile, conversation_name)
 
 
 def _event(session_id: str, payload: dict) -> dict:
@@ -483,6 +527,150 @@ def test_default_executor_is_process_wide_and_rpc_first():
     assert isinstance(first.primary, HermesSessionRpcTurnExecutor)
     assert isinstance(first.fallback, HermesProfileTurnExecutor)
     assert first.history_publisher is publish_bot_chain_history
+
+
+@pytest.mark.parametrize("canonical_exists", [False, True])
+def test_runner_recovers_completed_exact_turn_without_reexecution_or_republish(
+    tmp_path, canonical_exists
+):
+    """The same chain identity is an idempotency key for model and history."""
+    profile = _temp_profile(tmp_path, "worker")
+    if canonical_exists:
+        db = SessionDB(Path(profile.path) / "state.db")
+        try:
+            db.create_session(
+                "canonical",
+                source="desktop",
+                model=profile.model,
+                profile_name=profile.name,
+            )
+            db.set_session_title("canonical", "Bot Chat")
+            db.set_session_hidden("canonical", True)
+        finally:
+            db.close()
+
+    calls = []
+    conversation_name = "Bot Chain recover-completed"
+
+    def execute(profile, prompt, control, *, conversation_name):
+        calls.append((profile.name, prompt, conversation_name))
+        if len(calls) > 1:
+            raise AssertionError("completed durable turn executed twice")
+        _persist_and_publish_turn(
+            profile,
+            conversation_name,
+            prompt,
+            "durable answer",
+            session_id="completed-turn",
+        )
+        return "durable answer"
+
+    runner = BotChainRunner(turn_executor=execute)
+    first = runner.run(
+        [profile],
+        "do the task",
+        conversation_name=conversation_name,
+    )
+    db = SessionDB(Path(profile.path) / "state.db")
+    try:
+        canonical = db.get_session_by_title("Bot Chat")
+        assert canonical is not None
+        db.append_messages_batch(
+            canonical["id"],
+            [
+                {"role": "user", "content": "unrelated later turn"},
+                {"role": "assistant", "content": "unrelated later answer"},
+            ],
+        )
+    finally:
+        db.close()
+    recovered = runner.run(
+        [profile],
+        "do the task",
+        conversation_name=conversation_name,
+    )
+
+    assert first.final_output == "durable answer"
+    assert recovered.final_output == "durable answer"
+    assert len(calls) == 1
+    db = SessionDB(Path(profile.path) / "state.db")
+    try:
+        canonical = db.get_session_by_title("Bot Chat")
+        assert canonical is not None
+        assert [
+            (message["role"], message["content"])
+            for message in db.get_messages_as_conversation(canonical["id"])
+        ] == [
+            ("user", "do the task"),
+            ("assistant", "durable answer"),
+            ("user", "unrelated later turn"),
+            ("assistant", "unrelated later answer"),
+        ]
+    finally:
+        db.close()
+
+
+def test_runner_resumes_multibot_chain_after_last_durable_step(tmp_path):
+    """A crash before the next side effect resumes after, not before, it."""
+
+    class _CrashBeforeEffect(BaseException):
+        pass
+
+    writer = _temp_profile(tmp_path, "writer")
+    reviewer = _temp_profile(tmp_path, "reviewer")
+    conversation_name = "Bot Chain partial-resume"
+    attempts = []
+    side_effects = []
+
+    def execute(profile, prompt, control, *, conversation_name):
+        attempts.append((profile.name, prompt))
+        if profile.name == "reviewer" and not any(
+            name == "reviewer" for name, _output in side_effects
+        ):
+            reviewer_attempts = sum(
+                name == "reviewer" for name, _prompt in attempts
+            )
+            if reviewer_attempts == 1:
+                raise _CrashBeforeEffect()
+        if any(name == profile.name for name, _output in side_effects):
+            raise AssertionError(f"${profile.name} side effect executed twice")
+        output = "draft" if profile.name == "writer" else "final answer"
+        _persist_and_publish_turn(
+            profile,
+            conversation_name,
+            prompt,
+            output,
+            session_id=f"{profile.name}-turn",
+        )
+        side_effects.append((profile.name, output))
+        return output
+
+    runner = BotChainRunner(turn_executor=execute)
+    with pytest.raises(_CrashBeforeEffect):
+        runner.run(
+            [writer, reviewer],
+            "ship it",
+            conversation_name=conversation_name,
+        )
+
+    result = runner.run(
+        [writer, reviewer],
+        "ship it",
+        conversation_name=conversation_name,
+    )
+
+    assert side_effects == [
+        ("writer", "draft"),
+        ("reviewer", "final answer"),
+    ]
+    assert [name for name, _prompt in attempts] == [
+        "writer",
+        "reviewer",
+        "reviewer",
+    ]
+    assert "Previous bot ($writer) output:\ndraft" in attempts[-1][1]
+    assert result.final_output == "final answer"
+    assert [step.output for step in result.steps] == ["draft", "final answer"]
 
 
 def test_history_projection_promotes_first_isolated_turn_to_bot_chat(tmp_path):

@@ -15148,15 +15148,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # model execution and is the single authority deciding whether a
     # (re)delivered platform message may start a chain. States:
     #
-    #   admitted  — receipt persisted, execution not started yet
-    #   running   — execution in flight (best-effort marker)
+    #   admitted  — receipt persisted; no execution claim was durably
+    #               recorded, so NO side effect can have happened yet. A
+    #               redelivery that finds this state resumes the work under
+    #               the ORIGINAL chain identity instead of abandoning it.
+    #   running   — a process holds the atomic execution claim (recorded
+    #               BEFORE the first side effect). A redelivery that finds a
+    #               LIVE owner stands down; a provably dead owner's claim is
+    #               reclaimed to ``admitted`` — durable per-step history then
+    #               decides which side effects already happened, so recovery
+    #               re-executes only what never persisted.
     #   settled   — terminal; ``outcome`` binds the chain result
-    #               (completed | failed | cancelled | abandoned)
+    #               (completed | failed | cancelled).
     #
-    # A redelivery that finds ``admitted``/``running`` means the previous
-    # attempt died before settlement (or its settlement write failed); the
-    # row is reconciled to ``settled/abandoned`` WITHOUT re-executing the
-    # chain, because the side effects may already have happened.
+    # The first admission binds the chain identity (``chain_name``); later
+    # (re)deliveries of the same platform message reuse it and never
+    # overwrite it.
 
     _BOT_CHAIN_DELIVERIES_DDL = """
         session_id TEXT NOT NULL,
@@ -15165,10 +15172,88 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         state TEXT NOT NULL,
         outcome TEXT,
         detail TEXT,
+        owner_pid INTEGER,
+        owner_host TEXT,
         admitted_at REAL NOT NULL,
         updated_at REAL NOT NULL,
         PRIMARY KEY (session_id, platform_message_id)
     """
+
+    def _ensure_bot_chain_deliveries_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS bot_chain_deliveries ("
+            + self._BOT_CHAIN_DELIVERIES_DDL
+            + ")"
+        )
+        # Deployments that already ran the pre-owner-claim build have the
+        # table without the owner columns; CREATE IF NOT EXISTS cannot add
+        # them, so migrate in place.
+        have = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info('bot_chain_deliveries')")
+        }
+        if "owner_pid" not in have:
+            conn.execute(
+                "ALTER TABLE bot_chain_deliveries ADD COLUMN owner_pid INTEGER"
+            )
+        if "owner_host" not in have:
+            conn.execute(
+                "ALTER TABLE bot_chain_deliveries ADD COLUMN owner_host TEXT"
+            )
+
+    @staticmethod
+    def _claim_owner() -> tuple:
+        import socket
+
+        return os.getpid(), socket.gethostname()
+
+    @staticmethod
+    def _owner_alive(owner_pid, owner_host) -> bool:
+        """Conservative liveness check for a recorded claim owner.
+
+        Fails CLOSED: a foreign host, an empty pid, or any OS-level doubt
+        reads as alive, because a false reclaim would allow a second
+        execution — the exact failure this table exists to prevent. (PID
+        reuse after death is accepted residual risk: a recycled pid keeps
+        the row claimed until that process exits, never double-executes.)
+        """
+        try:
+            pid = int(owner_pid) if owner_pid is not None else 0
+        except (TypeError, ValueError):
+            return True
+        if pid <= 0:
+            return True
+        import socket
+
+        if not owner_host or owner_host != socket.gethostname():
+            return True
+        if os.name == "nt":
+            try:
+                import ctypes
+
+                kernel32 = ctypes.windll.kernel32
+                # PROCESS_QUERY_LIMITED_INFORMATION
+                handle = kernel32.OpenProcess(0x1000, False, pid)
+                if not handle:
+                    return False
+                try:
+                    code = ctypes.c_ulong()
+                    if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                        return True
+                    return code.value == 259  # STILL_ACTIVE
+                finally:
+                    kernel32.CloseHandle(handle)
+            except Exception:
+                return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # exists, owned by someone else
+        except Exception:
+            return True
+        return True
 
     def admit_bot_chain_delivery(
         self,
@@ -15180,22 +15265,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         Returns one of:
 
-        * ``"admitted"`` — fresh receipt written; the caller MUST execute
-          the chain and later call :meth:`settle_bot_chain_delivery`.
+        * ``"admitted"`` — the caller holds a fresh or resumed admission and
+          MUST win the atomic execution claim via
+          :meth:`mark_bot_chain_delivery_running` before any side effect,
+          then settle via :meth:`settle_bot_chain_delivery`. Also returned
+          when a previous attempt died before its claim (state was still
+          ``admitted`` — no side effect can exist) or its claim owner is
+          provably dead; the recorded chain identity is reused, never
+          replaced, so recovery continues the SAME chain.
+        * ``"running"`` — a live owner holds the execution claim; the
+          caller must not execute anything.
         * ``"settled"`` — this platform message already ran to settlement;
           the caller must not execute anything.
-        * ``"reconciled"`` — a previous attempt never settled (crash or a
-          failed settlement write). The stale row is settled as
-          ``abandoned`` and the caller must not re-execute the chain.
         """
         now = time.time()
 
         def _do(conn: sqlite3.Connection) -> str:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS bot_chain_deliveries ("
-                + self._BOT_CHAIN_DELIVERIES_DDL
-                + ")"
-            )
+            self._ensure_bot_chain_deliveries_table(conn)
             cursor = conn.execute(
                 "INSERT OR IGNORE INTO bot_chain_deliveries "
                 "(session_id, platform_message_id, chain_name, state, "
@@ -15205,43 +15291,90 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if cursor.rowcount:
                 return "admitted"
             row = conn.execute(
-                "SELECT state FROM bot_chain_deliveries "
+                "SELECT state, owner_pid, owner_host FROM bot_chain_deliveries "
                 "WHERE session_id = ? AND platform_message_id = ?",
                 (session_id, platform_message_id),
             ).fetchone()
-            if row is not None and row[0] == "settled":
+            if row[0] == "settled":
                 return "settled"
+            if row[0] == "running" and self._owner_alive(row[1], row[2]):
+                return "running"
+            # Resume/reclaim: reset to a fresh admission under the ORIGINAL
+            # chain identity. The next step for the caller is the atomic
+            # claim — admission alone never authorizes side effects.
             conn.execute(
-                "UPDATE bot_chain_deliveries SET state = 'settled', "
-                "outcome = 'abandoned', detail = ?, updated_at = ? "
+                "UPDATE bot_chain_deliveries SET state = 'admitted', "
+                "outcome = NULL, detail = NULL, owner_pid = NULL, "
+                "owner_host = NULL, updated_at = ? "
                 "WHERE session_id = ? AND platform_message_id = ?",
-                (
-                    "Redelivered before the previous attempt settled; the "
-                    "chain is not re-executed so its side effects cannot "
-                    "happen twice.",
-                    now,
-                    session_id,
-                    platform_message_id,
-                ),
+                (now, session_id, platform_message_id),
             )
-            return "reconciled"
+            return "admitted"
 
         return self._execute_write(_do)
 
     def mark_bot_chain_delivery_running(
         self, session_id: str, platform_message_id: str
-    ) -> None:
-        """Best-effort admitted → running transition before execution."""
+    ) -> bool:
+        """Atomically claim execution for an admitted receipt.
 
-        def _do(conn: sqlite3.Connection) -> None:
-            conn.execute(
+        Returns True only for the single caller that transitioned the row
+        from ``admitted`` to ``running``; every concurrent or late contender
+        gets False and MUST execute zero model turns. The claim records the
+        owning process so a later admission can distinguish a live in-flight
+        execution (stand down) from a dead owner (reclaim and resume). This
+        write is the durable execution claim: it must land BEFORE any side
+        effect, and a lost or failed claim means the chain does not run.
+        """
+        pid, host = self._claim_owner()
+        now = time.time()
+
+        def _do(conn: sqlite3.Connection) -> bool:
+            self._ensure_bot_chain_deliveries_table(conn)
+            cursor = conn.execute(
                 "UPDATE bot_chain_deliveries SET state = 'running', "
-                "updated_at = ? WHERE session_id = ? AND "
-                "platform_message_id = ? AND state = 'admitted'",
-                (time.time(), session_id, platform_message_id),
+                "owner_pid = ?, owner_host = ?, updated_at = ? "
+                "WHERE session_id = ? AND platform_message_id = ? AND "
+                "state = 'admitted'",
+                (pid, host, now, session_id, platform_message_id),
             )
+            return cursor.rowcount == 1
 
-        self._execute_write(_do)
+        return self._execute_write(_do)
+
+    def release_bot_chain_delivery_claim(
+        self, session_id: str, platform_message_id: str
+    ) -> bool:
+        """Release THIS process's own ``running`` claim back to ``admitted``.
+
+        Used when execution finished but the settlement write failed: left
+        in ``running`` under a live owner, the receipt would make every
+        later redelivery stand down forever — silent loss, the exact class
+        this table exists to prevent. Released back to ``admitted``, a
+        redelivery resumes under the recorded chain identity and recovers
+        every durably persisted step instead of re-executing blindly.
+
+        The release is owner-scoped (``owner_pid``/``owner_host`` must
+        match this process), so it can never revoke a concurrent live
+        execution's claim. Returns True only when this process's own
+        ``running`` row moved back to ``admitted``; a foreign claim, an
+        ``admitted`` row, and a ``settled`` row all return False untouched.
+        """
+        pid, host = self._claim_owner()
+        now = time.time()
+
+        def _do(conn: sqlite3.Connection) -> bool:
+            self._ensure_bot_chain_deliveries_table(conn)
+            cursor = conn.execute(
+                "UPDATE bot_chain_deliveries SET state = 'admitted', "
+                "owner_pid = NULL, owner_host = NULL, updated_at = ? "
+                "WHERE session_id = ? AND platform_message_id = ? AND "
+                "state = 'running' AND owner_pid = ? AND owner_host = ?",
+                (now, session_id, platform_message_id, pid, host),
+            )
+            return cursor.rowcount == 1
+
+        return self._execute_write(_do)
 
     def settle_bot_chain_delivery(
         self,
@@ -15253,10 +15386,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     ) -> None:
         """Bind the terminal chain outcome to the admission receipt.
 
-        Unconditional last-writer-wins: when a redelivery reconciled a stale
-        attempt to ``abandoned`` while the original execution was still in
-        flight, the real execution's settlement overwrites it with the
-        truthful outcome.
+        Unconditional last-writer-wins: when a stale claim was reclaimed
+        while the original execution somehow still settled afterwards, the
+        truthful terminal outcome wins over any intermediate state.
         """
 
         def _do(conn: sqlite3.Connection) -> None:

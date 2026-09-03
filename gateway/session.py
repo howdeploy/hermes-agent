@@ -31,6 +31,15 @@ class TranscriptReadError(RuntimeError):
         super().__init__(f"transcript read failed for session {session_id}")
 
 
+class BotChainAdmissionUnavailable(RuntimeError):
+    """Raised when a bot-chain delivery cannot obtain a durable receipt.
+
+    No owning session store (or a failed admission/claim write) means the
+    chain must execute ZERO model turns: without a durable admission row a
+    platform redelivery would execute the chain again.
+    """
+
+
 def _now() -> datetime:
     """Return the current local time."""
     return datetime.now()
@@ -4342,25 +4351,36 @@ class SessionStore:
     ) -> str:
         """Durably admit an inbound bot-chain event; see SessionDB.
 
-        Returns ``"admitted"`` / ``"settled"`` / ``"reconciled"``. Unlike the
+        Returns ``"admitted"`` / ``"running"`` / ``"settled"``. Unlike the
         read-only dedupe probe above, errors PROPAGATE: when the receipt
         cannot be persisted the caller must refuse to execute, because
         running the chain without a durable admission row would reopen the
-        duplicate-execution window on redelivery. With no DB at all
-        (in-memory sessions) there is nothing to persist and the caller
-        proceeds without dedupe, matching pre-admission behavior.
+        duplicate-execution window on redelivery. A session with no owning
+        durable store (a named profile whose home cannot be resolved, the
+        same state ``_append_transcript_message`` refuses to write into)
+        raises :class:`BotChainAdmissionUnavailable` — a synthetic
+        "admitted" here would execute the chain with no receipt at all and
+        re-execute it on every platform redelivery.
         """
         db = self._db_for_session_id(session_id)
         if db is None:
-            return "admitted"
+            raise BotChainAdmissionUnavailable(
+                f"no owning session store for {session_id}; "
+                "refusing bot-chain admission without a durable receipt"
+            )
         return db.admit_bot_chain_delivery(session_id, platform_message_id, chain_name)
 
     def mark_bot_chain_delivery_running(
         self, session_id: str, platform_message_id: str
-    ) -> None:
+    ) -> bool:
+        """Atomic execution claim; False/raise means zero model turns."""
         db = self._db_for_session_id(session_id)
-        if db is not None:
-            db.mark_bot_chain_delivery_running(session_id, platform_message_id)
+        if db is None:
+            raise BotChainAdmissionUnavailable(
+                f"no owning session store for {session_id}; "
+                "cannot durably claim bot-chain execution"
+            )
+        return db.mark_bot_chain_delivery_running(session_id, platform_message_id)
 
     def settle_bot_chain_delivery(
         self,
@@ -4375,6 +4395,35 @@ class SessionStore:
             db.settle_bot_chain_delivery(
                 session_id, platform_message_id, outcome=outcome, detail=detail
             )
+
+    def get_bot_chain_delivery(
+        self, session_id: str, platform_message_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read back the admission receipt (authoritative chain identity).
+
+        Returns None when no owning store exists or no receipt was recorded;
+        callers fall back to the identity they just admitted.
+        """
+        db = self._db_for_session_id(session_id)
+        if db is None:
+            return None
+        return db.get_bot_chain_delivery(session_id, platform_message_id)
+
+    def release_bot_chain_delivery_claim(
+        self, session_id: str, platform_message_id: str
+    ) -> bool:
+        """Best-effort release of THIS process's own execution claim.
+
+        Called from the settlement-failure path: a receipt left ``running``
+        under this live process would stand every redelivery down forever.
+        Owner-scoped in SessionDB, so a concurrent live claim is never
+        revoked. Returns False when there is no owning store (no receipt
+        exists there either) or no own ``running`` row to release.
+        """
+        db = self._db_for_session_id(session_id)
+        if db is None:
+            return False
+        return db.release_bot_chain_delivery_claim(session_id, platform_message_id)
 
     def rewrite_transcript(
         self,

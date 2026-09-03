@@ -999,6 +999,84 @@ def build_handoff_prompt(
     )
 
 
+def _last_assistant_text(messages: Sequence[Mapping[str, Any]]) -> Optional[str]:
+    for message in reversed(messages):
+        if message.get("role") == "assistant":
+            content = str(message.get("content") or "")
+            if content.strip():
+                return content
+    return None
+
+
+def _output_after_prompt(
+    messages: Sequence[Mapping[str, Any]], prompt: str
+) -> Optional[str]:
+    """Assistant reply following the first exact user-prompt match."""
+    want = str(prompt or "")
+    for index, message in enumerate(messages):
+        if message.get("role") != "user" or str(message.get("content") or "") != want:
+            continue
+        for followup in messages[index + 1 :]:
+            if followup.get("role") == "assistant":
+                content = str(followup.get("content") or "")
+                if content.strip():
+                    return content
+        return None
+    return None
+
+
+def recover_durable_step_output(
+    profile: BotProfile, conversation_name: str, input_text: str
+) -> Optional[str]:
+    """Recover one chain step's output from the profile's durable state.
+
+    The chain identity (``conversation_name``) is the idempotency key: a
+    crash after a step's model turn persisted but before the next side
+    effect must resume AFTER that step, never re-execute it. Two durable
+    shapes exist: the isolated chain session that kept its title (the
+    append-publish path), and the matching user/assistant pair inside the
+    canonical Bot Chat for a first turn whose session was promoted (the
+    rename-publish path). Returns ``None`` when no durable proof exists and
+    on any probe failure — recovery must never block a legitimate run.
+    """
+    from hermes_state import SessionDB
+    from tools.bot_mode_probe import BOT_CHAT_TITLE
+
+    db_path = Path(profile.path) / "state.db"
+    if not db_path.is_file():
+        return None
+    db = None
+    try:
+        db = SessionDB(db_path)
+        source = db.get_session_by_title(conversation_name)
+        if source is not None and source.get("id"):
+            recovered = _last_assistant_text(
+                db.get_messages_as_conversation(str(source["id"]))
+            )
+            if recovered is not None:
+                return recovered
+        canonical = db.get_session_by_title(BOT_CHAT_TITLE)
+        if canonical is not None and canonical.get("id"):
+            return _output_after_prompt(
+                db.get_messages_as_conversation(str(canonical["id"])),
+                input_text,
+            )
+        return None
+    except Exception:
+        logger.debug(
+            "bot-chain durable recovery probe failed for $%s",
+            profile.name,
+            exc_info=True,
+        )
+        return None
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
 class BotChainRunner:
     """Run an already-resolved ordered profile chain."""
 
@@ -1036,12 +1114,23 @@ class BotChainRunner:
             if control.cancel_event.is_set():
                 raise BotChainCancelled("Bot chain stopped.")
             control.touch()
-            output = self.turn_executor(
-                profile,
-                next_input,
-                control,
-                conversation_name=conversation_name,
+            # Idempotent recipient processing (#100758): when this exact chain
+            # identity already has a durable completed turn for this profile,
+            # recover its output instead of re-executing — a redelivery after
+            # a crash resumes after the last durable side effect, and the
+            # canonical-history projection is never published twice.
+            recovered = recover_durable_step_output(
+                profile, conversation_name, next_input
             )
+            if recovered is not None:
+                output = recovered
+            else:
+                output = self.turn_executor(
+                    profile,
+                    next_input,
+                    control,
+                    conversation_name=conversation_name,
+                )
             step = BotChainStep(profile=profile, input_text=next_input, output=output)
             steps.append(step)
             if on_step is not None:

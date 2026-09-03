@@ -21347,10 +21347,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message_id = str(event.message_id) if event.message_id else None
         conversation_name: Optional[str] = None
         if message_id:
-            # Legacy receipt: events processed before the admission table
-            # existed are deduped by their persisted transcript row.
-            if await self.async_session_store.has_platform_message_id(
-                session_entry.session_id, message_id
+            # The admission receipt is the authority whenever one exists;
+            # the legacy transcript-row dedupe below applies ONLY to events
+            # processed before the admission table existed. A released or
+            # resumable receipt must reach the state machine below — stopping
+            # at the transcript row would leave it admitted (non-terminal)
+            # forever even though its durable outcome is recoverable.
+            receipt = None
+            try:
+                get_receipt = getattr(
+                    self.async_session_store, "get_bot_chain_delivery", None
+                )
+                if get_receipt is not None:
+                    receipt = await get_receipt(
+                        session_entry.session_id, message_id
+                    )
+            except Exception:
+                # Probe failure must not block: admission below decides.
+                receipt = None
+                logger.debug(
+                    "bot-chain receipt probe failed (message_id=%s)",
+                    message_id,
+                    exc_info=True,
+                )
+            if (
+                receipt is None
+                and await self.async_session_store.has_platform_message_id(
+                    session_entry.session_id, message_id
+                )
             ):
                 logger.info(
                     "Skipping duplicate bot-chain turn (message_id=%s) in session %s",
@@ -21379,6 +21403,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "receipt could not be persisted. Please resend the message."
                 )
             if admission != "admitted":
+                # "settled": already ran to completion. "running": a live
+                # owner holds the execution claim. Either way — zero turns.
                 logger.info(
                     "Skipping %s bot-chain turn (message_id=%s) in session %s",
                     admission,
@@ -21386,18 +21412,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry.session_id,
                 )
                 return None
+            # The receipt, not this process, owns the chain identity: a
+            # resumed admission (crash before execution) reuses the name
+            # bound at the FIRST delivery, so durable step recovery continues
+            # the same chain sessions instead of minting a parallel chain.
+            # The pre-admission probe above already read it when the row
+            # predates this delivery; read it back only for a fresh admit.
+            if receipt is None:
+                try:
+                    get_receipt = getattr(
+                        self.async_session_store, "get_bot_chain_delivery", None
+                    )
+                    if get_receipt is not None:
+                        receipt = await get_receipt(session_entry.session_id, message_id)
+                except Exception:
+                    logger.debug(
+                        "bot-chain receipt read-back failed (message_id=%s); "
+                        "keeping the freshly admitted identity",
+                        message_id,
+                        exc_info=True,
+                    )
+            if receipt and receipt.get("chain_name"):
+                conversation_name = str(receipt["chain_name"])
+            # The atomic execution claim is the durable boundary before any
+            # side effect: a lost or failed claim means zero model turns —
+            # the platform redelivery will resume the still-admitted receipt.
             try:
-                await self.async_session_store.mark_bot_chain_delivery_running(
+                claimed = await self.async_session_store.mark_bot_chain_delivery_running(
                     session_entry.session_id, message_id
                 )
             except Exception:
-                # Best-effort marker only; the admission row already
-                # guarantees no second execution.
-                logger.debug(
-                    "bot-chain running marker failed (message_id=%s)",
+                logger.warning(
+                    "Bot-chain execution claim failed (message_id=%s, session %s); "
+                    "executing zero turns",
                     message_id,
+                    session_entry.session_id,
                     exc_info=True,
                 )
+                return None
+            if not claimed:
+                logger.info(
+                    "Bot-chain execution claim lost to a concurrent attempt "
+                    "(message_id=%s) in session %s; standing down",
+                    message_id,
+                    session_entry.session_id,
+                )
+                return None
 
         control = BotChainControl()
         chain_state = self._session_state(routing_key)
@@ -21434,22 +21494,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Settlement lands BEFORE the transcript rows and is never
             # swallowed silently: it is the receipt that forbids a second
             # execution when a later write fails and the platform redelivers.
-            try:
-                await self.async_session_store.settle_bot_chain_delivery(
-                    session_entry.session_id,
-                    message_id,
-                    outcome=outcome,
-                    detail=response[:500],
-                )
-            except Exception:
-                logger.warning(
-                    "Bot-chain settlement write failed (message_id=%s, session %s); "
-                    "a redelivery will reconcile the stale admission without "
-                    "re-executing the chain",
-                    message_id,
-                    session_entry.session_id,
-                    exc_info=True,
-                )
+            settled = False
+            for _attempt in range(2):  # one immediate retry for a transient wedge
+                try:
+                    await self.async_session_store.settle_bot_chain_delivery(
+                        session_entry.session_id,
+                        message_id,
+                        outcome=outcome,
+                        detail=response[:500],
+                    )
+                    settled = True
+                    break
+                except Exception:
+                    logger.warning(
+                        "Bot-chain settlement write failed (message_id=%s, "
+                        "session %s, attempt %d/2)",
+                        message_id,
+                        session_entry.session_id,
+                        _attempt + 1,
+                        exc_info=True,
+                    )
+            if not settled:
+                # The receipt is still "running" under THIS live process;
+                # left as-is, every redelivery would stand down forever.
+                # Release our own claim so a redelivery resumes the
+                # admission and recovers every durably persisted step
+                # instead of re-executing blindly. The release is
+                # owner-scoped, so a concurrent live claim is never
+                # revoked; if the release write also fails, the claim holds
+                # only until this process exits — dead-owner reclaim then
+                # resumes the admission.
+                try:
+                    released = await self.async_session_store.release_bot_chain_delivery_claim(
+                        session_entry.session_id, message_id
+                    )
+                except Exception:
+                    released = False
+                    logger.warning(
+                        "Bot-chain claim release failed (message_id=%s, "
+                        "session %s); the claim holds until this process "
+                        "exits, then a redelivery reclaims it",
+                        message_id,
+                        session_entry.session_id,
+                        exc_info=True,
+                    )
+                if released:
+                    logger.warning(
+                        "Bot-chain settlement could not be persisted "
+                        "(message_id=%s, session %s); released the execution "
+                        "claim so a redelivery resumes the admission and "
+                        "recovers every durably persisted step",
+                        message_id,
+                        session_entry.session_id,
+                    )
         user_entry = {
             "role": "user",
             "content": event.text or "",

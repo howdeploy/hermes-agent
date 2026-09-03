@@ -193,23 +193,31 @@ def _local_roster(root: Path) -> list[str]:
     return names
 
 
-def _enabled_local_roster(root: Path) -> list[str]:
-    """Bot Mode profiles callable from user-facing CLI/Telegram sessions."""
-    names = []
-    for name in _local_roster(root):
-        profile_dir = root if name == "default" else root / "profiles" / name
-        try:
-            from hermes_cli.profiles import read_profile_meta
+def _is_profile_callable(root: Path, name: str) -> bool:
+    """Live ``bot.enabled`` decision for one profile.
 
-            if not read_profile_meta(profile_dir).get("bot_enabled", True):
-                continue
-        except Exception:
-            # A metadata boundary that cannot be read authoritatively fails
-            # closed: unknown authority must not widen the callable roster.
-            # Delivery still validates that the resolved profile exists.
-            continue
-        names.append(name)
-    return names
+    A metadata boundary that cannot be read authoritatively fails closed:
+    unknown authority must not widen the callable roster. ``read_profile_meta``
+    itself never raises (corrupt YAML maps to ``bot_enabled=False``); the
+    guard here covers import/IO surprises around it.
+    """
+    profile_dir = root if name == "default" else root / "profiles" / name
+    try:
+        from hermes_cli.profiles import read_profile_meta
+
+        return bool(read_profile_meta(profile_dir).get("bot_enabled", True))
+    except Exception:
+        return False
+
+
+def _enabled_local_roster(root: Path) -> list[str]:
+    """Bot Mode profiles callable from ANY messaging surface.
+
+    The ``bot.enabled`` execution gate is surface-independent: interactive
+    CLI/Telegram sessions and canonical Bot Chat sessions resolve targets
+    against the same live callable roster.
+    """
+    return [name for name in _local_roster(root) if _is_profile_callable(root, name)]
 
 
 def _peers(root: Path) -> list[str]:
@@ -279,11 +287,12 @@ def message_agent_tool(
 
     root = _hermes_root(Path(home))
     me = _self_profile_name(Path(home))
-    roster = (
-        _enabled_local_roster(root)
-        if session_kind == _SESSION_KIND_USER
-        else _local_roster(root)
-    )
+    # One callable roster for every surface (#100758): Bot Chat sessions get
+    # the same live bot.enabled filtering as interactive user sessions, so a
+    # disabled or metadata-corrupt profile is uncallable from bot-to-bot
+    # delivery too. The roster is read fresh on every call, so a profile
+    # disabled after the prompt section was built is already excluded here.
+    roster = _enabled_local_roster(root)
     peers = _peers(root)
     teammates = [_handle(n) for n in roster if n != me]
 
@@ -373,6 +382,17 @@ def message_agent_tool(
         if relayed is not None:
             return relayed
         return _err("You can't message yourself. Pick a teammate from the roster.")
+
+    # Dispatch re-evaluates the live gate (#100758): a cached prompt section
+    # is never authority to launch a profile whose bot.enabled flipped — or
+    # whose metadata became unreadable — after the prompt was built.
+    if not _is_profile_callable(root, resolved):
+        return _err(
+            f"@{_handle(resolved)} is not callable right now (bot.disabled or "
+            "unreadable profile metadata). Pick another teammate from the roster.",
+            roster=teammates,
+            peers=peers,
+        )
 
     return _start_delivery(
         [

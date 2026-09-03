@@ -274,6 +274,86 @@ def test_tool_delivers_from_telegram_user_session(tmp_path, monkeypatch):
     assert captured["content"].endswith("Review the release plan.")
 
 
+@pytest.mark.parametrize(
+    "profile_yaml",
+    [
+        pytest.param(
+            textwrap.dedent(
+                """\
+                bot:
+                  enabled: false
+                ui_meta:
+                  hermes-bots:
+                    shape: cloud
+                """
+            ),
+            id="disabled",
+        ),
+        pytest.param("bot: [unclosed\n", id="corrupt"),
+    ],
+)
+def test_canonical_bot_chat_omits_and_refuses_uncallable_profile_without_spawn(
+    tmp_path, monkeypatch, profile_yaml
+):
+    """The operator's profile authority applies to the original Bot Chat too."""
+    home = _managed_home(tmp_path, teammates=("writer", "reviewer"))
+    (home / "profiles" / "reviewer" / "profile.yaml").write_text(
+        profile_yaml,
+        encoding="utf-8",
+    )
+    agent = _FakeAgent(home, title="Bot Chat")
+    calls = _capture_spawn(monkeypatch)
+
+    section = bot_mode_probe.get_bot_mode_protocol_section(home)
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(
+            target="reviewer",
+            message="Review this change.",
+            agent=agent,
+        )
+    )
+
+    assert "`@writer`" in section
+    assert "`@reviewer`" not in section
+    assert "error" in result
+    assert calls == []
+
+
+def test_canonical_bot_chat_dispatch_rechecks_live_enabled_gate(
+    tmp_path, monkeypatch
+):
+    """A cached prompt is not authority to launch a bot disabled afterward."""
+    home = _managed_home(tmp_path, teammates=("reviewer",))
+    agent = _FakeAgent(home, title="Bot Chat")
+    calls = _capture_spawn(monkeypatch)
+
+    section = bot_mode_probe.get_bot_mode_protocol_section(home)
+    assert "`@reviewer`" in section
+    (home / "profiles" / "reviewer" / "profile.yaml").write_text(
+        textwrap.dedent(
+            """\
+            bot:
+              enabled: false
+            ui_meta:
+              hermes-bots:
+                shape: cloud
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(
+            target="reviewer",
+            message="This must not launch.",
+            agent=agent,
+        )
+    )
+
+    assert "error" in result
+    assert calls == []
+
+
 def test_tool_refuses_on_unmanaged_install(tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()

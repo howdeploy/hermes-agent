@@ -172,10 +172,16 @@ def _profile_role(profile_dir: Path) -> str:
 
 
 def _roster_lines(root: Path, me: str) -> list[str]:
-    """One '- `@handle` — role' line per teammate (excluding ``me``)."""
+    """One '- `@handle` — role' line per callable teammate (excluding ``me``).
+
+    The ``bot.enabled`` execution gate applies to the canonical Bot Chat
+    projection exactly as it does to the user-surface roster: disabled
+    profiles and profiles whose metadata cannot be read authoritatively are
+    omitted, so the prompt never advertises a target dispatch would refuse.
+    """
     lines = []
     for name, profile_dir in _roster(root):
-        if name == me:
+        if name == me or not _is_bot_enabled(profile_dir):
             continue
         role = _profile_role(profile_dir)
         handle = _handle(name)
