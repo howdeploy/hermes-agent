@@ -841,7 +841,7 @@ def _terminate_process(proc: subprocess.Popen) -> None:
         return
     try:
         if os.name != "nt":
-            os.killpg(proc.pid, signal.SIGTERM)
+            os.killpg(proc.pid, signal.SIGTERM)  # windows-footgun: ok — POSIX branch
         else:  # pragma: no cover - Windows
             proc.terminate()
         proc.wait(timeout=2)
@@ -850,7 +850,7 @@ def _terminate_process(proc: subprocess.Popen) -> None:
         pass
     try:
         if os.name != "nt":
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX branch
         else:  # pragma: no cover - Windows
             proc.kill()
     except OSError:
