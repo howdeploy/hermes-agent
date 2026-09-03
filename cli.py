@@ -16951,6 +16951,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         ]
         if self._session_db is not None and self.session_id:
             try:
+                # The chain turn never runs this CLI session's own agent, so
+                # the lazy session row creation in run_agent never fires.
+                # When a $Bot chain is the FIRST turn of a fresh session the
+                # messages insert below violates the messages→sessions FK.
+                # create_session is an ON CONFLICT upsert, so this is a cheap
+                # no-op once the row exists.
+                self._session_db.create_session(
+                    session_id=self.session_id,
+                    source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                    model=self.model,
+                    model_config={
+                        "max_iterations": self.max_turns,
+                        "reasoning_config": self.reasoning_config,
+                    },
+                )
                 self._session_db.append_messages_batch(self.session_id, messages)
             except Exception:
                 logger.warning("Failed to persist CLI bot-chain exchange", exc_info=True)
