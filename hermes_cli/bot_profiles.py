@@ -159,6 +159,20 @@ def list_bot_profiles() -> list[BotProfile]:
     ]
 
 
+def check_bot_chain_profile_access(profile: BotProfile, home: Path | None = None) -> None:
+    """Live execution authority shared by resolution and each dispatched step."""
+    from hermes_constants import get_hermes_home
+    from tools.bot_mode_probe import _configured_targets, _hermes_root, _profile_name, _is_roster_profile_dir, _is_bot_enabled
+
+    home = home if home is not None else get_hermes_home()
+    root = _hermes_root(home)
+    allowed = _configured_targets(root, _profile_name(home))
+    if not _is_roster_profile_dir(root, profile.path) or (allowed is not None and profile.name not in allowed):
+        raise ValueError(f"Bot '${profile.name}' is not allowed by the active profile's Bot Mode roster.")
+    if not _is_bot_enabled(profile.path):
+        raise ValueError(f"Bot '${profile.name}' is disabled or its metadata is unreadable.")
+
+
 def resolve_bot_chain(names: Sequence[str]) -> list[BotProfile]:
     """Resolve ordered nicknames and fail before any model turn starts."""
     available = list_bot_profiles()
@@ -174,6 +188,7 @@ def resolve_bot_chain(names: Sequence[str]) -> list[BotProfile]:
             raise ValueError(
                 f"Unknown bot '${nickname}'. Available bots: {display}."
             )
+        check_bot_chain_profile_access(profile)
         if not profile.enabled:
             raise ValueError(
                 f"Bot '${profile.name}' is disabled. Enable it with: "

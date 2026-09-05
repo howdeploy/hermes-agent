@@ -332,6 +332,7 @@ class GatewayBotChainMixin:
             BotChainControl,
             BotChainError,
             BotChainRunner,
+            BotChainRecoveryUnavailable,
             format_bot_chain_result,
         )
         from hermes_cli.bot_profiles import resolve_bot_chain
@@ -346,6 +347,9 @@ class GatewayBotChainMixin:
             conversation_name, claim_token = admitted
 
         control = BotChainControl()
+        from hermes_constants import get_hermes_home
+
+        control.source_home = get_hermes_home()
         if message_id and claim_token:
             from functools import partial
 
@@ -411,6 +415,13 @@ class GatewayBotChainMixin:
                         pass
                 raise
             response = format_bot_chain_result(result)
+        except BotChainRecoveryUnavailable as exc:
+            if message_id and claim_token:
+                try:
+                    await self.async_session_store.release_bot_chain_delivery_claim(session_id, message_id, claim_token)
+                except Exception:
+                    logger.warning("Could not release deferred bot-chain recovery claim", exc_info=True)
+            return f"Bot chain recovery deferred: {exc} Retry this delivery when its state store is available."
         except BotChainCancelled:
             cancelled = True
             outcome = "cancelled"

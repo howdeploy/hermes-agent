@@ -1936,7 +1936,8 @@ class GatewayTurnMixin:
         source, session_entry, session_key = resolved
         if chain_request is not None:
             await self._hmwa_open_session(session_entry, session_key, source)
-            return await self._handle_bot_chain_turn(event, session_entry, _quick_key, chain_request)
+            with self._profile_scope_for_source(source):
+                return await self._handle_bot_chain_turn(event, session_entry, _quick_key, chain_request)
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )

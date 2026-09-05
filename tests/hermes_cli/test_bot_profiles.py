@@ -143,6 +143,20 @@ def test_read_profile_meta_missing_file_keeps_legacy_default(bot_home):
     assert profiles_mod.read_profile_meta(profile_dir)["bot_enabled"] is True
 
 
+@pytest.mark.parametrize("roster", [[], None, "invalid", [{"from": "default", "to": "other"}]])
+def test_explicit_chain_obeys_declarative_roster(bot_home, roster):
+    _write_bot(bot_home, "worker")
+    config_path = bot_home / "config.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    config["agent"] = {"bot_mode": {"enabled": True, "roster": roster}}
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    with pytest.raises(ValueError, match="not allowed"):
+        resolve_bot_chain(["worker"])
+    config["agent"]["bot_mode"]["roster"] = [{"from": "default", "to": "worker"}]
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    assert [profile.name for profile in resolve_bot_chain(["worker"])] == ["worker"]
+
+
 def test_read_profile_meta_corrupt_yaml_fails_closed(bot_home):
     profile_dir = _write_bot(bot_home, "broken", profile_yaml="bot: [unclosed\n")
     assert profiles_mod.read_profile_meta(profile_dir)["bot_enabled"] is False

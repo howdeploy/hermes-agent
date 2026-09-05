@@ -49,6 +49,10 @@ class BotChainCancelled(BotChainError):
     """The operator stopped an active chain."""
 
 
+class BotChainRecoveryUnavailable(BotChainError):
+    """Durable step state cannot be proven; retry admission, never replay blindly."""
+
+
 class BotTopicBindingError(BotChainError):
     """A ``$Name`` Telegram topic requested a bot that cannot run.
 
@@ -164,6 +168,7 @@ class BotChainControl:
         self._on_redirect = on_redirect
         self._last_activity = time.time()
         self.publication_guard = contextlib.nullcontext
+        self.source_home: Optional[Path] = None
 
     @contextlib.contextmanager
     def guard_publication(self):
@@ -696,6 +701,12 @@ def publish_bot_chain_history(
                 # the model turn ran: the new receipt owner publishes — this
                 # stale generation must not create/rename/write Bot Chat.
                 raise BotChainCancelled("Bot chain stopped.")
+            canonical = db.get_session_by_title(BOT_CHAT_TITLE)
+            if canonical is not None:
+                canonical_id = str(canonical["id"])
+                canonical_tip = db.get_compression_tip(canonical_id) or canonical_id
+                if _receipt_stamped_output(db.get_messages_as_conversation(canonical_tip), title) is not None:
+                    return canonical_tip
             source = db.get_session_by_title(title)
             if source is None:
                 raise RuntimeError(
@@ -704,7 +715,6 @@ def publish_bot_chain_history(
             source_root_id = str(source.get("id") or "")
             source_tip_id = db.get_compression_tip(source_root_id) or source_root_id
 
-            canonical = db.get_session_by_title(BOT_CHAT_TITLE)
             if canonical is None:
                 with control.guard_publication() if control is not None else contextlib.nullcontext():
                     if control is not None and control.cancel_event.is_set():
@@ -814,6 +824,8 @@ def publish_bot_chain_history(
                         # Claim lost while waiting on the canonical chat's turn
                         # lease: no stale append under the new owner's receipt.
                         raise BotChainCancelled("Bot chain stopped.")
+                    if _receipt_stamped_output(db.get_messages_as_conversation(canonical_tip_id), title) is not None:
+                        return canonical_tip_id
                     db.reopen_session(canonical_tip_id)
                     db.append_messages_batch(
                         canonical_tip_id,
@@ -870,6 +882,11 @@ class FallbackBotTurnExecutor:
                 control,
                 conversation_name=conversation_name,
             )
+        self.publish_history(profile, conversation_name, control)
+        return output
+
+    def publish_history(self, profile, conversation_name, control):
+        """Complete (or recover) the history projection without replaying inference."""
         if self.history_publisher is not None:
             if control.cancel_event.is_set():
                 # The execution claim was lost mid-turn (or the chain was
@@ -884,18 +901,10 @@ class FallbackBotTurnExecutor:
                 )
             except BotChainCancelled:
                 raise
-            except Exception:
-                # The model turn already completed and is durable in its
-                # isolated Bot Chain session. Never report the whole turn as
-                # failed (or invite a duplicate retry) merely because the
-                # user-facing canonical-history projection could not finish.
-                logger.warning(
-                    "Bot-chain turn completed for $%s but could not publish "
-                    "its history to Bot Chat",
-                    profile.name,
-                    exc_info=True,
-                )
-        return output
+            except Exception as exc:
+                raise BotChainRecoveryUnavailable(
+                    f"${profile.name}'s turn is durable but its Bot Chat publication is pending."
+                ) from exc
 
 
 def _terminate_process(proc: subprocess.Popen) -> None:
@@ -1062,8 +1071,9 @@ def build_handoff_prompt(
 
 
 def _last_assistant_text(messages: Sequence[Mapping[str, Any]]) -> Optional[str]:
-    for message in reversed(messages):
-        if message.get("role") == "assistant":
+    if messages:
+        message = messages[-1]
+        if message.get("role") == "assistant" and not message.get("tool_calls"):
             content = str(message.get("content") or "")
             if content.strip():
                 return content
@@ -1108,18 +1118,20 @@ def recover_durable_step_output(
     retires the chain title, so the receipt rides on the promoted/copied
     rows). Recovery NEVER matches on prompt text: a brand-new chain that
     repeats an older prompt must execute its own model turn. Returns
-    ``None`` when no durable proof exists and on any probe failure —
-    recovery must never block a legitimate run.
+    ``None`` only when no durable proof exists. An unreadable store is not
+    evidence that execution never happened, so errors defer the delivery.
     """
     from hermes_state import SessionDB
     from tools.bot_mode_probe import BOT_CHAT_TITLE
 
     db_path = Path(profile.path) / "state.db"
-    if not db_path.is_file():
-        return None
     db = None
     try:
-        db = SessionDB(db_path)
+        try:
+            db_path.lstat()
+        except FileNotFoundError:
+            return None
+        db = SessionDB(db_path, read_only=True)
         source = db.get_session_by_title(conversation_name)
         if source is not None and source.get("id"):
             recovered = _last_assistant_text(
@@ -1136,13 +1148,15 @@ def recover_durable_step_output(
                 conversation_name,
             )
         return None
-    except Exception:
-        logger.debug(
+    except Exception as exc:
+        logger.warning(
             "bot-chain durable recovery probe failed for $%s",
             profile.name,
             exc_info=True,
         )
-        return None
+        raise BotChainRecoveryUnavailable(
+            f"Cannot verify ${profile.name}'s durable chain history; no turn was replayed."
+        ) from exc
     finally:
         if db is not None:
             try:
@@ -1189,6 +1203,13 @@ class BotChainRunner:
                 raise BotChainCancelled("Bot chain stopped.")
             with control.guard_publication():
                 pass  # Recheck receipt authority before starting the next step.
+            if control.source_home is not None:
+                from hermes_cli.bot_profiles import check_bot_chain_profile_access
+
+                try:
+                    check_bot_chain_profile_access(profile, control.source_home)
+                except (OSError, ValueError) as exc:
+                    raise BotTurnError(profile.name, str(exc), reason="missing_config") from exc
             control.touch()
             # Idempotent recipient processing (#100758): when this exact chain
             # identity already has a durable completed turn for this profile,
@@ -1202,6 +1223,9 @@ class BotChainRunner:
             )
             if recovered is not None:
                 output = recovered
+                publish = getattr(self.turn_executor, "publish_history", None)
+                if publish is not None:
+                    publish(profile, conversation_name, control)
             else:
                 output = self.turn_executor(
                     profile,

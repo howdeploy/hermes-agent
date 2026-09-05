@@ -22,6 +22,14 @@ from hermes_state import SessionDB
 from hermes_cli.bot_profiles import BotProfile
 
 
+@pytest.fixture(autouse=True)
+def _routed_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+
 class _AsyncStore:
     def __init__(self):
         self._store = SimpleNamespace(bot_chain_publication_guard=lambda *_: contextlib.nullcontext())
@@ -291,6 +299,35 @@ def _wire_runner(monkeypatch, async_store):
     state = SimpleNamespace(turn=SimpleNamespace(agent=None, started_ts=0.0))
     runner._session_state = lambda _key: state
     return runner
+
+
+def test_recovery_read_failure_releases_receipt_without_execution(tmp_path, monkeypatch):
+    db = SessionDB(tmp_path / "ingress.db")
+    db.create_session("session-1", source="telegram")
+    profile = _profile(tmp_path)
+    target = SessionDB(profile.path / "state.db")
+    target.close()
+    monkeypatch.setattr("hermes_cli.bot_profiles.resolve_bot_chain", lambda _names: [profile])
+    def no_execution(*args, **kwargs):
+        pytest.fail("unreadable durable history must never replay a model turn")
+    monkeypatch.setattr("agent.bot_chain.default_bot_turn_executor", lambda: no_execution)
+    def unavailable(*args, **kwargs):
+        raise OSError("state read unavailable")
+    monkeypatch.setattr(SessionDB, "get_session_by_title", unavailable)
+    runner = _wire_runner(monkeypatch, _DurableAsyncStore(db))
+    event = SimpleNamespace(text="$worker task", message_id="recovery-deferred", internal=False)
+    session = SimpleNamespace(session_id="session-1", session_key="telegram:test")
+    try:
+        response = asyncio.run(runner._handle_bot_chain_turn(
+            event, session, session.session_key, parse_bot_chain_message(event.text),
+        ))
+        assert "recovery deferred" in response
+        receipt = db.get_bot_chain_delivery("session-1", event.message_id)
+        assert receipt["state"] == "admitted"
+        assert receipt["owner_token"] is None
+        assert not db.has_platform_message_id("session-1", event.message_id)
+    finally:
+        db.close()
 
 
 def test_gateway_bot_chain_redelivery_after_transcript_failure_never_reexecutes(

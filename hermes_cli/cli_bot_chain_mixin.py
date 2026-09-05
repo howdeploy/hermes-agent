@@ -62,6 +62,11 @@ class CLIBotChainMixin:
             return True
         if request is None:
             return False
+        from tools.bot_mode_probe import _session_source, _internal_or_finite_session
+
+        if _session_source(self.agent) != "cli" or _internal_or_finite_session(self.agent):
+            _cprint("  Bot chains require an interactive CLI session.")
+            return True
         if images:
             _cprint("  Bot chains currently accept text messages only.")
             return True
@@ -81,6 +86,9 @@ class CLIBotChainMixin:
         control = BotChainControl(
             on_redirect=lambda payload: self._pending_input.put(payload)
         )
+        from hermes_constants import get_hermes_home
+
+        control.source_home = get_hermes_home()
         previous_agent = self.agent
         self.agent = control
 

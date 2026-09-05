@@ -230,6 +230,26 @@ def test_runner_honors_preexisting_cancellation():
         )
 
 
+@pytest.mark.parametrize("revoke", ["profile", "roster"])
+def test_live_policy_stops_next_step_after_resolution(tmp_path, revoke):
+    first = _temp_profile(tmp_path, "first")
+    second = _temp_profile(tmp_path, "second")
+    home = first.path.parent.parent
+    control = BotChainControl()
+    control.source_home = home
+    calls = []
+    def execute(profile, *args, **kwargs):
+        calls.append(profile.name)
+        if revoke == "profile":
+            (second.path / "profile.yaml").write_text("bot:\n  enabled: false\n", encoding="utf-8")
+        else:
+            (home / "config.yaml").write_text("agent:\n  bot_mode:\n    roster: []\n", encoding="utf-8")
+        return "first result"
+    with pytest.raises(BotTurnError):
+        BotChainRunner(execute).run([first, second], "task", control=control)
+    assert calls == ["first"]
+
+
 def test_parallel_chain_runs_receive_distinct_conversations():
     conversations = []
     conversations_lock = threading.Lock()
@@ -688,6 +708,21 @@ def test_runner_executes_fresh_chain_when_prompt_repeats_older_bot_chat_turn(
         db.close()
 
 
+def test_unreadable_durable_step_never_replays_model(tmp_path, monkeypatch):
+    from agent.bot_chain import BotChainRecoveryUnavailable
+
+    profile = _temp_profile(tmp_path, "worker")
+    with_db = SessionDB(profile.path / "state.db")
+    with_db.close()
+    def unreadable(*args, **kwargs):
+        raise OSError("state store unavailable")
+    monkeypatch.setattr(SessionDB, "get_session_by_title", unreadable)
+    def no_execution(*args, **kwargs):
+        pytest.fail("cannot prove missing step, must not execute")
+    with pytest.raises(BotChainRecoveryUnavailable):
+        BotChainRunner(turn_executor=no_execution).run([profile], "task", conversation_name="Bot Chain old")
+
+
 def test_runner_resumes_multibot_chain_after_last_durable_step(tmp_path):
     """A crash before the next side effect resumes after, not before, it."""
 
@@ -931,7 +966,47 @@ def test_history_projection_appends_to_existing_bot_chat_despite_desktop_owner(
         db.close()
 
 
+@pytest.mark.parametrize("canonical_exists", [False, True])
+def test_recovery_finishes_pending_publication_once(tmp_path, canonical_exists):
+    from agent.bot_chain import BotChainRecoveryUnavailable
+
+    profile = _temp_profile(tmp_path, "worker")
+    db = SessionDB(profile.path / "state.db")
+    if canonical_exists:
+        db.create_session("canonical", source="desktop")
+        db.set_session_title("canonical", "Bot Chat")
+    calls = []
+    def primary(profile, prompt, control, *, conversation_name):
+        calls.append(prompt)
+        db.create_session("isolated", source="cli")
+        db.set_session_title("isolated", conversation_name)
+        db.append_messages_batch("isolated", [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "durable result"},
+        ])
+        return "durable result"
+    def no_fallback(*args, **kwargs):
+        pytest.fail("publication failures must not replay inference")
+    def unavailable(*args, **kwargs):
+        raise OSError("projection temporarily unavailable")
+    executor = FallbackBotTurnExecutor(primary, no_fallback, history_publisher=unavailable)
+    runner = BotChainRunner(executor)
+    try:
+        with pytest.raises(BotChainRecoveryUnavailable):
+            runner.run([profile], "task", conversation_name="Bot Chain resume-publish")
+        executor.history_publisher = publish_bot_chain_history
+        for _ in range(2):
+            result = runner.run([profile], "task", conversation_name="Bot Chain resume-publish")
+            assert result.final_output == "durable result"
+        assert calls == ["task"]
+        canonical = db.get_session_by_title("Bot Chat")
+        assert [m["content"] for m in db.get_messages_as_conversation(canonical["id"])] == ["task", "durable result"]
+    finally:
+        db.close()
+
+
 def test_history_projection_failure_does_not_replay_completed_turn():
+    from agent.bot_chain import BotChainRecoveryUnavailable
     published = []
 
     def primary(*_args, **_kwargs):
@@ -950,12 +1025,13 @@ def test_history_projection_failure_does_not_replay_completed_turn():
         history_publisher=publisher,
     )
 
-    assert executor(
-        _profile("worker"),
-        "do it",
-        BotChainControl(),
-        conversation_name="Bot Chain completed",
-    ) == "completed once"
+    with pytest.raises(BotChainRecoveryUnavailable, match="publication is pending"):
+        executor(
+            _profile("worker"),
+            "do it",
+            BotChainControl(),
+            conversation_name="Bot Chain completed",
+        )
     assert published == ["attempted"]
 
 
