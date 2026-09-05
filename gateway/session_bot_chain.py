@@ -8,6 +8,13 @@ class BotChainAdmissionUnavailable(RuntimeError):
 
 
 class SessionBotChainStoreMixin:
+    def bot_chain_publication_guard(self, session_id: str, platform_message_id: str, owner_token: str):
+        """Synchronous worker-side publication fence in the receipt-owning DB."""
+        db = self._db_for_session_id(session_id)
+        if db is None:
+            raise BotChainAdmissionUnavailable(f"no owning session store for {session_id}")
+        return db.bot_chain_publication_guard(session_id, platform_message_id, owner_token)
+
     def admit_bot_chain_delivery(
         self, session_id: str, platform_message_id: str, chain_name: str
     ) -> str:
@@ -89,7 +96,7 @@ class SessionBotChainStoreMixin:
         """Read back the admission receipt (authoritative chain identity).
 
         Returns None when no owning store exists or no receipt was recorded;
-        callers fall back to the identity they just admitted.
+        callers must not execute without an authoritative identity readback.
         """
         db = self._db_for_session_id(session_id)
         if db is None:

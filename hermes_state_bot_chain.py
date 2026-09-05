@@ -46,6 +46,7 @@ Two durable mechanisms live here:
    never on prompt text.
 """
 
+import contextlib
 import json
 import logging
 import math
@@ -58,6 +59,10 @@ from typing import Any, Dict, Optional, Sequence
 # Moved methods logged under the "hermes_state" logger before the split;
 # keep that logger identity so log filtering/capture behavior is unchanged.
 logger = logging.getLogger("hermes_state")
+
+
+class BotChainClaimLostError(RuntimeError):
+    """The receipt no longer authorizes this runtime to publish a step."""
 
 
 class SessionBotChainMixin:
@@ -75,6 +80,40 @@ class SessionBotChainMixin:
     #: (``{"bot_chain": {"chain": <conversation_name>}}``). Recovery may
     #: skip re-execution only on this identity match, never on prompt text.
     BOT_CHAIN_RECEIPT_METADATA_KEY = "bot_chain"
+
+    @contextlib.contextmanager
+    def _bot_chain_fence(self):
+        """Serialize receipt ownership changes with bounded local publication.
+
+        A separate SQLite lock file avoids holding state.db's writer while a
+        publisher writes another profile (or the SAME state.db). Native SQLite
+        locking works across processes and supported filesystems on all OSes;
+        the kernel releases it after a crash. Never held during model execution.
+        """
+        # ponytail: one fence per ingress DB; shard per receipt if publication contention matters.
+        conn = sqlite3.connect(f"{self.db_path}.bot-chain-lock", timeout=5, isolation_level=None)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            yield
+        finally:
+            conn.close()
+
+    def _bot_chain_write(self, fn):
+        with self._bot_chain_fence():
+            return self._execute_write(fn)
+
+    @contextlib.contextmanager
+    def bot_chain_publication_guard(self, session_id: str, platform_message_id: str, owner_token: str):
+        """Fence the claim check AND publication against concurrent reclaim."""
+        with self._bot_chain_fence():
+            row = self.get_bot_chain_delivery(session_id, platform_message_id)
+            if not (
+                owner_token and row and row["state"] == "running"
+                and row["owner_token"] == owner_token
+                and (row["lease_expires_at"] or 0) > time.time()
+            ):
+                raise BotChainClaimLostError("Bot-chain execution claim expired or changed owner")
+            yield
 
     _BOT_CHAIN_DELIVERIES_DDL = """
         session_id TEXT NOT NULL,
@@ -235,7 +274,7 @@ class SessionBotChainMixin:
             )
             return "admitted"
 
-        return self._execute_write(_do)
+        return self._bot_chain_write(_do)
 
     def mark_bot_chain_delivery_running(
         self,
@@ -283,7 +322,7 @@ class SessionBotChainMixin:
             )
             return cursor.rowcount == 1
 
-        return owner_token if self._execute_write(_do) else None
+        return owner_token if self._bot_chain_write(_do) else None
 
     def renew_bot_chain_delivery_claim(
         self,
@@ -323,7 +362,7 @@ class SessionBotChainMixin:
             )
             return cursor.rowcount == 1
 
-        return bool(self._execute_write(_do))
+        return bool(self._bot_chain_write(_do))
 
     def release_bot_chain_delivery_claim(
         self,
@@ -361,7 +400,7 @@ class SessionBotChainMixin:
             )
             return cursor.rowcount == 1
 
-        return self._execute_write(_do)
+        return self._bot_chain_write(_do)
 
     def settle_bot_chain_delivery(
         self,
@@ -398,7 +437,7 @@ class SessionBotChainMixin:
             )
             return cursor.rowcount == 1
 
-        return bool(self._execute_write(_do))
+        return bool(self._bot_chain_write(_do))
 
     def get_bot_chain_delivery(
         self, session_id: str, platform_message_id: str

@@ -751,6 +751,51 @@ def test_runner_resumes_multibot_chain_after_last_durable_step(tmp_path):
     assert [step.output for step in result.steps] == ["draft", "final answer"]
 
 
+@pytest.mark.parametrize("existing_canonical", [False, True])
+@pytest.mark.parametrize("same_database", [False, True])
+def test_history_publication_refuses_reclaimed_owner_before_heartbeat(tmp_path, existing_canonical, same_database):
+    from functools import partial
+    from hermes_state import SessionDB
+
+    profile_home = tmp_path / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    target = SessionDB(profile_home / "state.db")
+    ingress = target if same_database else SessionDB(tmp_path / "state.db")
+    try:
+        target.create_session("isolated", source="cli")
+        target.set_session_title("isolated", "Bot Chain fence")
+        target.append_messages_batch("isolated", [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "durable answer"},
+        ])
+        if existing_canonical:
+            target.create_session("canonical", source="desktop")
+            target.set_session_title("canonical", "Bot Chat")
+        ingress.admit_bot_chain_delivery("gateway", "event", "Bot Chain fence")
+        old_token = ingress.mark_bot_chain_delivery_running("gateway", "event")
+        control = BotChainControl()
+        control.publication_guard = partial(ingress.bot_chain_publication_guard, "gateway", "event", old_token)
+        ingress.release_bot_chain_delivery_claim("gateway", "event", old_token)
+        new_token = ingress.mark_bot_chain_delivery_running("gateway", "event")
+        assert not control.cancel_event.is_set()  # no heartbeat has observed the loss
+        profile = BotProfile(name="worker", path=profile_home, model="test", provider="test", system_prompt="Work")
+        with pytest.raises(BotChainCancelled):
+            publish_bot_chain_history(profile, "Bot Chain fence", control=control)
+        assert target.get_session_by_title("Bot Chain fence") is not None
+        if existing_canonical:
+            assert target.get_messages_as_conversation("canonical") == []
+        else:
+            assert target.get_session_by_title("Bot Chat") is None
+        control = BotChainControl()
+        control.publication_guard = partial(ingress.bot_chain_publication_guard, "gateway", "event", new_token)
+        canonical_id = publish_bot_chain_history(profile, "Bot Chain fence", control=control)
+        assert any(m.get("content") == "durable answer" for m in target.get_messages_as_conversation(canonical_id))
+    finally:
+        if ingress is not target:
+            ingress.close()
+        target.close()
+
+
 def test_history_projection_promotes_first_isolated_turn_to_bot_chat(tmp_path):
     from hermes_state import SessionDB
 

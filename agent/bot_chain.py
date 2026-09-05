@@ -11,6 +11,7 @@ implement a second inference client.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import itertools
 import logging
@@ -162,6 +163,20 @@ class BotChainControl:
         self._active_children_lock = threading.Lock()
         self._on_redirect = on_redirect
         self._last_activity = time.time()
+        self.publication_guard = contextlib.nullcontext
+
+    @contextlib.contextmanager
+    def guard_publication(self):
+        from hermes_state_bot_chain import BotChainClaimLostError
+
+        try:
+            with self.publication_guard():
+                if self.cancel_event.is_set():
+                    raise BotChainCancelled("Bot chain stopped.")
+                yield
+        except BotChainClaimLostError as exc:
+            self.cancel_event.set()
+            raise BotChainCancelled(str(exc)) from exc
 
     def touch(self) -> None:
         self._last_activity = time.time()
@@ -691,51 +706,54 @@ def publish_bot_chain_history(
 
             canonical = db.get_session_by_title(BOT_CHAT_TITLE)
             if canonical is None:
-                if control is not None and control.cancel_event.is_set():
-                    # Re-checked under the DB lock, immediately before the
-                    # first mutation (receipt stamp + rename into Bot Chat).
-                    raise BotChainCancelled("Bot chain stopped.")
-                # The rename retires the chain-titled session, so the exact
-                # chain identity must survive on the message rows themselves:
-                # recovery from Bot Chat is keyed by that receipt, never by
-                # prompt text.
-                stamped_rows = db.get_messages_as_conversation(
-                    source_tip_id,
-                    repair_alternation=False,
-                    include_row_ids=True,
-                )
-                db.stamp_bot_chain_receipt(
-                    [m.get("_row_id") for m in stamped_rows], title
-                )
-                try:
-                    promoted = db.set_session_title(source_root_id, BOT_CHAT_TITLE)
-                except ValueError:
-                    # Desktop may have persisted its lazy Bot Chat between the
-                    # lookup and rename. Resolve that winner and copy below.
-                    canonical = db.get_session_by_title(BOT_CHAT_TITLE)
-                    if canonical is None:
-                        raise
-                else:
-                    if not promoted:
-                        raise RuntimeError(
-                            f"could not promote Bot Chain session {source_root_id}"
-                        )
-                    db.set_session_hidden(source_root_id, True)
-                    return source_tip_id
+                with control.guard_publication() if control is not None else contextlib.nullcontext():
+                    if control is not None and control.cancel_event.is_set():
+                        # Re-checked under the DB lock, immediately before the
+                        # first mutation (receipt stamp + rename into Bot Chat).
+                        raise BotChainCancelled("Bot chain stopped.")
+                    # The rename retires the chain-titled session, so the exact
+                    # chain identity must survive on the message rows themselves:
+                    # recovery from Bot Chat is keyed by that receipt, never by
+                    # prompt text.
+                    stamped_rows = db.get_messages_as_conversation(
+                        source_tip_id,
+                        repair_alternation=False,
+                        include_row_ids=True,
+                    )
+                    db.stamp_bot_chain_receipt(
+                        [m.get("_row_id") for m in stamped_rows], title
+                    )
+                    try:
+                        promoted = db.set_session_title(source_root_id, BOT_CHAT_TITLE)
+                    except ValueError:
+                        # Desktop may have persisted its lazy Bot Chat between the
+                        # lookup and rename. Resolve that winner and copy below.
+                        canonical = db.get_session_by_title(BOT_CHAT_TITLE)
+                        if canonical is None:
+                            raise
+                    else:
+                        if not promoted:
+                            raise RuntimeError(
+                                f"could not promote Bot Chain session {source_root_id}"
+                            )
+                        db.set_session_hidden(source_root_id, True)
+                        return source_tip_id
 
             canonical_root_id = str(canonical.get("id") or "")
             if not canonical_root_id:
                 raise RuntimeError("canonical Bot Chat has no session id")
             if canonical_root_id == source_root_id:
-                db.set_session_hidden(canonical_root_id, True)
+                with control.guard_publication() if control is not None else contextlib.nullcontext():
+                    db.set_session_hidden(canonical_root_id, True)
                 return source_tip_id
             if canonical.get("archived"):
-                if not db.unarchive_recoverable_session(canonical_root_id):
-                    raise RuntimeError(
-                        "canonical Bot Chat is deliberately archived; refusing "
-                        "to override that user boundary"
-                    )
-                canonical = db.get_session(canonical_root_id) or canonical
+                with control.guard_publication() if control is not None else contextlib.nullcontext():
+                    if not db.unarchive_recoverable_session(canonical_root_id):
+                        raise RuntimeError(
+                            "canonical Bot Chat is deliberately archived; refusing "
+                            "to override that user boundary"
+                        )
+                    canonical = db.get_session(canonical_root_id) or canonical
 
             source_messages = db.get_messages_as_conversation(
                 source_tip_id,
@@ -789,20 +807,21 @@ def publish_bot_chain_history(
                     "canonical Bot Chat stayed busy while publishing chain history"
                 )
             try:
-                # A normal inbound delivery reopens the canonical conversation;
-                # the transcript projection must have the same lifecycle shape.
-                if control is not None and control.cancel_event.is_set():
-                    # Claim lost while waiting on the canonical chat's turn
-                    # lease: no stale append under the new owner's receipt.
-                    raise BotChainCancelled("Bot chain stopped.")
-                db.reopen_session(canonical_tip_id)
-                db.append_messages_batch(
-                    canonical_tip_id,
-                    copied_messages,
-                    turn_lease_holder=holder,
-                    turn_lease_ttl_seconds=max(30.0, wait_seconds + 5.0),
-                )
-                db.set_session_hidden(canonical_root_id, True)
+                with control.guard_publication() if control is not None else contextlib.nullcontext():
+                    # A normal inbound delivery reopens the canonical conversation;
+                    # the transcript projection must have the same lifecycle shape.
+                    if control is not None and control.cancel_event.is_set():
+                        # Claim lost while waiting on the canonical chat's turn
+                        # lease: no stale append under the new owner's receipt.
+                        raise BotChainCancelled("Bot chain stopped.")
+                    db.reopen_session(canonical_tip_id)
+                    db.append_messages_batch(
+                        canonical_tip_id,
+                        copied_messages,
+                        turn_lease_holder=holder,
+                        turn_lease_ttl_seconds=max(30.0, wait_seconds + 5.0),
+                    )
+                    db.set_session_hidden(canonical_root_id, True)
             finally:
                 db.release_session_turn_lease(canonical_tip_id, holder)
             return canonical_tip_id
@@ -1168,6 +1187,8 @@ class BotChainRunner:
         for index, profile in enumerate(ordered):
             if control.cancel_event.is_set():
                 raise BotChainCancelled("Bot chain stopped.")
+            with control.guard_publication():
+                pass  # Recheck receipt authority before starting the next step.
             control.touch()
             # Idempotent recipient processing (#100758): when this exact chain
             # identity already has a durable completed turn for this profile,
@@ -1188,6 +1209,8 @@ class BotChainRunner:
                     control,
                     conversation_name=conversation_name,
                 )
+            with control.guard_publication():
+                pass  # Do not emit a stale generation's result before heartbeat catches up.
             step = BotChainStep(profile=profile, input_text=next_input, output=output)
             steps.append(step)
             if on_step is not None:

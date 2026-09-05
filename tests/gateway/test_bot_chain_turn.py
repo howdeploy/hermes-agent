@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import subprocess
 import sys
 from pathlib import Path
@@ -23,7 +24,7 @@ from hermes_cli.bot_profiles import BotProfile
 
 class _AsyncStore:
     def __init__(self):
-        self._store = object()
+        self._store = SimpleNamespace(bot_chain_publication_guard=lambda *_: contextlib.nullcontext())
         self.appended = []
         self.updated = []
         self.admissions = {}
@@ -78,6 +79,7 @@ class _DurableAsyncStore(_AsyncStore):
     def __init__(self, db):
         super().__init__()
         self.db = db
+        self._store = SimpleNamespace(bot_chain_publication_guard=db.bot_chain_publication_guard)
 
     async def has_platform_message_id(self, session_id, message_id):
         return self.db.has_platform_message_id(session_id, message_id)

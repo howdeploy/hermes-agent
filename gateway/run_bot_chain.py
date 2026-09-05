@@ -336,6 +336,7 @@ class GatewayBotChainMixin:
         )
         from hermes_cli.bot_profiles import resolve_bot_chain
 
+        session_id = session_entry.session_id
         message_id = str(event.message_id) if event.message_id else None
         conversation_name = claim_token = None
         if message_id:
@@ -345,6 +346,13 @@ class GatewayBotChainMixin:
             conversation_name, claim_token = admitted
 
         control = BotChainControl()
+        if message_id and claim_token:
+            from functools import partial
+
+            control.publication_guard = partial(
+                self.session_store.bot_chain_publication_guard,
+                session_id, message_id, claim_token,
+            )
         claim_state: dict = {"lost": False}
         heartbeat = None
         if message_id and claim_token:
@@ -354,7 +362,7 @@ class GatewayBotChainMixin:
             # the claim mid-execution cancels the chain (handled below).
             heartbeat = asyncio.create_task(
                 self._bot_chain_claim_heartbeat(
-                    session_entry.session_id,
+                    session_id,
                     message_id,
                     claim_token,
                     control,
@@ -437,7 +445,7 @@ class GatewayBotChainMixin:
                 "Bot-chain claim was reclaimed mid-execution (message_id=%s, "
                 "session %s); standing down without transcript writes",
                 message_id,
-                session_entry.session_id,
+                session_id,
             )
             return None
         if message_id:
@@ -451,7 +459,7 @@ class GatewayBotChainMixin:
             for _attempt in range(2):  # one immediate retry for a transient wedge
                 try:
                     settle_result = await self.async_session_store.settle_bot_chain_delivery(
-                        session_entry.session_id,
+                        session_id,
                         message_id,
                         outcome=outcome,
                         detail=response[:500],
@@ -462,7 +470,7 @@ class GatewayBotChainMixin:
                             "Bot-chain settlement refused: claim no longer ours "
                             "(message_id=%s, session %s); standing down",
                             message_id,
-                            session_entry.session_id,
+                            session_id,
                         )
                         claim_state["lost"] = True
                     settled = True
@@ -472,7 +480,7 @@ class GatewayBotChainMixin:
                         "Bot-chain settlement write failed (message_id=%s, "
                         "session %s, attempt %d/2)",
                         message_id,
-                        session_entry.session_id,
+                        session_id,
                         _attempt + 1,
                         exc_info=True,
                     )
@@ -488,7 +496,7 @@ class GatewayBotChainMixin:
                 # admission.
                 try:
                     released = await self.async_session_store.release_bot_chain_delivery_claim(
-                        session_entry.session_id, message_id, claim_token
+                        session_id, message_id, claim_token
                     )
                 except Exception:
                     released = False
@@ -497,7 +505,7 @@ class GatewayBotChainMixin:
                         "session %s); the claim holds until its lease "
                         "expires, then a redelivery reclaims it",
                         message_id,
-                        session_entry.session_id,
+                        session_id,
                         exc_info=True,
                     )
                 if released:
@@ -507,7 +515,7 @@ class GatewayBotChainMixin:
                         "claim so a redelivery resumes the admission and "
                         "recovers every durably persisted step",
                         message_id,
-                        session_entry.session_id,
+                        session_id,
                     )
             if claim_state["lost"]:
                 # The settlement write landed nowhere we own: the receipt was
@@ -524,11 +532,11 @@ class GatewayBotChainMixin:
             user_entry["message_id"] = message_id
         try:
             await self.async_session_store.append_to_transcript(
-                session_entry.session_id,
+                session_id,
                 user_entry,
             )
             await self.async_session_store.append_to_transcript(
-                session_entry.session_id,
+                session_id,
                 {
                     "role": "assistant",
                     "content": response,
@@ -542,7 +550,7 @@ class GatewayBotChainMixin:
         except Exception:
             logger.warning(
                 "Failed to persist bot-chain exchange for session %s",
-                session_entry.session_id,
+                session_id,
                 exc_info=True,
             )
 

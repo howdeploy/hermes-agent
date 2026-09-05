@@ -29,6 +29,40 @@ def db(tmp_path):
 
 
 class TestBotChainDeliveryAdmission:
+    def test_publication_fence_excludes_reclaim_and_allows_same_db_write(self, db, monkeypatch):
+        from hermes_state_bot_chain import BotChainClaimLostError
+
+        now = [100.0]
+        monkeypatch.setattr("hermes_state_bot_chain.time.time", lambda: now[0])
+        db.admit_bot_chain_delivery("sess-chain", "fenced", "Bot Chain fenced")
+        token = db.mark_bot_chain_delivery_running("sess-chain", "fenced", lease_seconds=10)
+        started, finished = threading.Event(), threading.Event()
+
+        def reclaim():
+            contender = SessionDB(db.db_path)
+            try:
+                started.set()
+                result = contender.admit_bot_chain_delivery("sess-chain", "fenced", "Bot Chain replacement")
+                finished.set()
+                return result
+            finally:
+                contender.close()
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with db.bot_chain_publication_guard("sess-chain", "fenced", token):
+                now[0] = 200.0
+                future = pool.submit(reclaim)
+                assert started.wait(2)
+                assert not finished.wait(0.1)
+                db.append_message("sess-chain", role="assistant", content="published by valid owner")
+            assert future.result(timeout=3) == "admitted"
+        replacement = db.mark_bot_chain_delivery_running("sess-chain", "fenced")
+        assert replacement != token
+        with pytest.raises(BotChainClaimLostError):
+            with db.bot_chain_publication_guard("sess-chain", "fenced", token):
+                pytest.fail("stale owner entered publication")
+        assert db.get_bot_chain_delivery("sess-chain", "fenced")["chain_name"] == "Bot Chain fenced"
+
     def test_first_delivery_is_admitted_and_records_chain_identity(self, db):
         status = db.admit_bot_chain_delivery("sess-chain", "tg-1", "Bot Chain abc")
         assert status == "admitted"
