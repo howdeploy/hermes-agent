@@ -4372,8 +4372,12 @@ class SessionStore:
 
     def mark_bot_chain_delivery_running(
         self, session_id: str, platform_message_id: str
-    ) -> bool:
-        """Atomic execution claim; False/raise means zero model turns."""
+    ) -> Optional[str]:
+        """Atomic execution claim; None/raise means zero model turns.
+
+        Returns the claim's ``owner_token`` on success — required by the
+        heartbeat renewal, settlement, and release calls that follow.
+        """
         db = self._db_for_session_id(session_id)
         if db is None:
             raise BotChainAdmissionUnavailable(
@@ -4382,6 +4386,21 @@ class SessionStore:
             )
         return db.mark_bot_chain_delivery_running(session_id, platform_message_id)
 
+    def renew_bot_chain_delivery_claim(
+        self, session_id: str, platform_message_id: str, owner_token: str
+    ) -> bool:
+        """Heartbeat: extend the claim lease while execution is in flight.
+
+        Returns False when there is no owning store or the claim is no
+        longer ours (reclaimed after an expiry gap).
+        """
+        db = self._db_for_session_id(session_id)
+        if db is None:
+            return False
+        return db.renew_bot_chain_delivery_claim(
+            session_id, platform_message_id, owner_token
+        )
+
     def settle_bot_chain_delivery(
         self,
         session_id: str,
@@ -4389,12 +4408,18 @@ class SessionStore:
         *,
         outcome: str,
         detail: str = "",
-    ) -> None:
+        owner_token: Optional[str] = None,
+    ) -> bool:
         db = self._db_for_session_id(session_id)
-        if db is not None:
-            db.settle_bot_chain_delivery(
-                session_id, platform_message_id, outcome=outcome, detail=detail
-            )
+        if db is None:
+            return False
+        return db.settle_bot_chain_delivery(
+            session_id,
+            platform_message_id,
+            outcome=outcome,
+            detail=detail,
+            owner_token=owner_token,
+        )
 
     def get_bot_chain_delivery(
         self, session_id: str, platform_message_id: str
@@ -4410,20 +4435,25 @@ class SessionStore:
         return db.get_bot_chain_delivery(session_id, platform_message_id)
 
     def release_bot_chain_delivery_claim(
-        self, session_id: str, platform_message_id: str
+        self,
+        session_id: str,
+        platform_message_id: str,
+        owner_token: Optional[str] = None,
     ) -> bool:
-        """Best-effort release of THIS process's own execution claim.
+        """Best-effort release of THIS claim's execution row.
 
         Called from the settlement-failure path: a receipt left ``running``
-        under this live process would stand every redelivery down forever.
-        Owner-scoped in SessionDB, so a concurrent live claim is never
-        revoked. Returns False when there is no owning store (no receipt
-        exists there either) or no own ``running`` row to release.
+        would stand redeliveries down until the lease expires. Scoped by
+        ``owner_token`` in SessionDB, so a concurrent or newer claim is
+        never revoked. Returns False when there is no owning store (no
+        receipt exists there either) or no own ``running`` row to release.
         """
         db = self._db_for_session_id(session_id)
         if db is None:
             return False
-        return db.release_bot_chain_delivery_claim(session_id, platform_message_id)
+        return db.release_bot_chain_delivery_claim(
+            session_id, platform_message_id, owner_token
+        )
 
     def rewrite_transcript(
         self,

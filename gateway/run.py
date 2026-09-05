@@ -21319,6 +21319,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    async def _bot_chain_claim_heartbeat(
+        self,
+        session_id: str,
+        message_id: str,
+        owner_token: str,
+        control,
+        claim_state: dict,
+    ) -> None:
+        """Renew the bot-chain execution claim's lease while the chain runs.
+
+        The lease (SessionDB.BOT_CHAIN_CLAIM_LEASE_SECONDS) is what bounds a
+        dead runtime generation's claim; this loop keeps a healthy execution
+        authoritative across multi-minute model turns. When the claim is
+        lost — a renewal comes back False (reclaimed), or two renewals in a
+        row fail to land — the chain is cancelled and the caller stands
+        down: another delivery now owns the receipt and will settle it. The
+        two-miss rule trips at ~2/3 of the lease window, strictly BEFORE a
+        redelivery may reclaim the still-live-looking receipt.
+        """
+        from hermes_state import SessionDB
+
+        lease_seconds = SessionDB.BOT_CHAIN_CLAIM_LEASE_SECONDS
+        interval = max(0.1, lease_seconds / 3.0)
+        missed_renewals = 0
+        while True:
+            await asyncio.sleep(interval)
+            renew = getattr(
+                self.async_session_store, "renew_bot_chain_delivery_claim", None
+            )
+            if renew is None:
+                return
+            try:
+                renewed = await renew(session_id, message_id, owner_token)
+            except Exception:
+                logger.warning(
+                    "Bot-chain claim renewal failed (message_id=%s, session %s)",
+                    message_id,
+                    session_id,
+                    exc_info=True,
+                )
+                renewed = None
+            if renewed:
+                missed_renewals = 0
+                continue
+            if renewed is False:
+                # Authoritative answer from the receipt: this claim was
+                # reclaimed — stand down immediately.
+                missed_renewals = 2
+            else:
+                missed_renewals += 1
+            if missed_renewals < 2:
+                continue
+            logger.warning(
+                "Bot-chain claim lost mid-execution (message_id=%s, "
+                "session %s); cancelling the chain and standing down",
+                message_id,
+                session_id,
+            )
+            claim_state["lost"] = True
+            control.cancel_event.set()
+            return
+
     async def _handle_bot_chain_turn(
         self,
         event,
@@ -21416,29 +21478,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # resumed admission (crash before execution) reuses the name
             # bound at the FIRST delivery, so durable step recovery continues
             # the same chain sessions instead of minting a parallel chain.
-            # The pre-admission probe above already read it when the row
-            # predates this delivery; read it back only for a fresh admit.
-            if receipt is None:
-                try:
-                    get_receipt = getattr(
-                        self.async_session_store, "get_bot_chain_delivery", None
-                    )
-                    if get_receipt is not None:
-                        receipt = await get_receipt(session_entry.session_id, message_id)
-                except Exception:
-                    logger.debug(
-                        "bot-chain receipt read-back failed (message_id=%s); "
-                        "keeping the freshly admitted identity",
-                        message_id,
-                        exc_info=True,
-                    )
-            if receipt and receipt.get("chain_name"):
-                conversation_name = str(receipt["chain_name"])
+            # The identity MUST come from a successful receipt read-back —
+            # executing under a freshly minted random name after a failed
+            # read would fork the chain away from its durable receipt and
+            # invite a duplicate model turn on redelivery. Stand down until
+            # the platform redelivers instead.
+            receipt = None
+            try:
+                get_receipt = getattr(
+                    self.async_session_store, "get_bot_chain_delivery", None
+                )
+                if get_receipt is not None:
+                    receipt = await get_receipt(session_entry.session_id, message_id)
+            except Exception:
+                receipt = None
+                logger.warning(
+                    "bot-chain receipt read-back failed (message_id=%s)",
+                    message_id,
+                    exc_info=True,
+                )
+            chain_name = (
+                str(receipt.get("chain_name") or "").strip()
+                if isinstance(receipt, dict)
+                else ""
+            )
+            if not chain_name:
+                logger.warning(
+                    "Bot-chain receipt unreadable after admission "
+                    "(message_id=%s, session %s); standing down until "
+                    "redelivery — no model turn without the durable chain "
+                    "identity",
+                    message_id,
+                    session_entry.session_id,
+                )
+                return None
+            conversation_name = chain_name
             # The atomic execution claim is the durable boundary before any
             # side effect: a lost or failed claim means zero model turns —
             # the platform redelivery will resume the still-admitted receipt.
             try:
-                claimed = await self.async_session_store.mark_bot_chain_delivery_running(
+                claim_token = await self.async_session_store.mark_bot_chain_delivery_running(
                     session_entry.session_id, message_id
                 )
             except Exception:
@@ -21450,7 +21529,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc_info=True,
                 )
                 return None
-            if not claimed:
+            if not claim_token:
                 logger.info(
                     "Bot-chain execution claim lost to a concurrent attempt "
                     "(message_id=%s) in session %s; standing down",
@@ -21458,8 +21537,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry.session_id,
                 )
                 return None
+        else:
+            claim_token = None
 
         control = BotChainControl()
+        claim_state: dict = {"lost": False}
+        heartbeat = None
+        if message_id and claim_token:
+            # The claim is a bounded lease: renew it while the chain runs so
+            # a healthy execution is never reclaimed, while a dead runtime
+            # generation becomes reclaimable when its lease lapses. Losing
+            # the claim mid-execution cancels the chain (handled below).
+            heartbeat = asyncio.create_task(
+                self._bot_chain_claim_heartbeat(
+                    session_entry.session_id,
+                    message_id,
+                    claim_token,
+                    control,
+                    claim_state,
+                )
+            )
         chain_state = self._session_state(routing_key)
         chain_state.turn.agent = control
         chain_state.turn.started_ts = time.time()
@@ -21469,13 +21566,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         outcome = "completed"
         try:
             profiles = await asyncio.to_thread(resolve_bot_chain, request.names)
-            result = await asyncio.to_thread(
-                BotChainRunner().run,
-                profiles,
-                request.prompt,
-                control=control,
-                conversation_name=conversation_name,
+            # A bare ``await asyncio.to_thread(...)`` survives cancellation of
+            # THIS handler: the worker thread would keep executing an orphaned
+            # generation while the heartbeat finally-block below had already
+            # stopped renewing the claim — the lease then lapses and a
+            # redelivery starts a parallel execution of the same receipt.
+            # Run the chain as a shielded task instead: an external cancel
+            # signals the chain's cancel_event, keeps the claim heartbeat
+            # alive until the worker thread has ACTUALLY finished, and only
+            # then unwinds this handler.
+            worker_task = asyncio.create_task(
+                asyncio.to_thread(
+                    BotChainRunner().run,
+                    profiles,
+                    request.prompt,
+                    control=control,
+                    conversation_name=conversation_name,
+                )
             )
+            try:
+                result = await asyncio.shield(worker_task)
+            except asyncio.CancelledError:
+                control.cancel_event.set()
+                while not worker_task.done():
+                    try:
+                        await asyncio.shield(worker_task)
+                    except asyncio.CancelledError:
+                        # Repeated external cancels: keep signalling and keep
+                        # waiting — the heartbeat must outlive the worker.
+                        control.cancel_event.set()
+                    except Exception:
+                        pass
+                raise
             response = format_bot_chain_result(result)
         except BotChainCancelled:
             cancelled = True
@@ -21488,21 +21610,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             outcome = "failed"
             logger.exception("Unexpected bot-chain failure for session %s", routing_key)
             response = f"Bot chain failed: {exc}"
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                try:
+                    await heartbeat
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.debug(
+                        "bot-chain claim heartbeat failed on shutdown",
+                        exc_info=True,
+                    )
 
         timestamp = time.time()
+        if message_id and claim_state["lost"]:
+            # Our claim was reclaimed mid-execution (the heartbeat cancelled
+            # the chain): another delivery now owns the receipt and will
+            # settle and answer it. The stale owner stands down fully — no
+            # transcript copy, no user-facing response.
+            logger.warning(
+                "Bot-chain claim was reclaimed mid-execution (message_id=%s, "
+                "session %s); standing down without transcript writes",
+                message_id,
+                session_entry.session_id,
+            )
+            return None
         if message_id:
             # Settlement lands BEFORE the transcript rows and is never
             # swallowed silently: it is the receipt that forbids a second
             # execution when a later write fails and the platform redelivers.
+            # Settlement is scoped to our claim's owner_token; a False
+            # result means the claim was reclaimed (lease lapsed) and the
+            # new owner is now responsible for the terminal write.
             settled = False
             for _attempt in range(2):  # one immediate retry for a transient wedge
                 try:
-                    await self.async_session_store.settle_bot_chain_delivery(
+                    settle_result = await self.async_session_store.settle_bot_chain_delivery(
                         session_entry.session_id,
                         message_id,
                         outcome=outcome,
                         detail=response[:500],
+                        owner_token=claim_token,
                     )
+                    if settle_result is False:
+                        logger.info(
+                            "Bot-chain settlement refused: claim no longer ours "
+                            "(message_id=%s, session %s); standing down",
+                            message_id,
+                            session_entry.session_id,
+                        )
+                        claim_state["lost"] = True
                     settled = True
                     break
                 except Exception:
@@ -21515,25 +21673,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=True,
                     )
             if not settled:
-                # The receipt is still "running" under THIS live process;
-                # left as-is, every redelivery would stand down forever.
-                # Release our own claim so a redelivery resumes the
+                # The receipt is still "running" under OUR claim; left
+                # as-is, redeliveries would stand down until the lease
+                # lapses. Release our own claim so a redelivery resumes the
                 # admission and recovers every durably persisted step
-                # instead of re-executing blindly. The release is
-                # owner-scoped, so a concurrent live claim is never
+                # instead of re-executing blindly. The release is scoped by
+                # owner_token, so a concurrent or newer claim is never
                 # revoked; if the release write also fails, the claim holds
-                # only until this process exits — dead-owner reclaim then
-                # resumes the admission.
+                # only until its lease expires — reclaim then resumes the
+                # admission.
                 try:
                     released = await self.async_session_store.release_bot_chain_delivery_claim(
-                        session_entry.session_id, message_id
+                        session_entry.session_id, message_id, claim_token
                     )
                 except Exception:
                     released = False
                     logger.warning(
                         "Bot-chain claim release failed (message_id=%s, "
-                        "session %s); the claim holds until this process "
-                        "exits, then a redelivery reclaims it",
+                        "session %s); the claim holds until its lease "
+                        "expires, then a redelivery reclaims it",
                         message_id,
                         session_entry.session_id,
                         exc_info=True,
@@ -21547,6 +21705,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         message_id,
                         session_entry.session_id,
                     )
+            if claim_state["lost"]:
+                # The settlement write landed nowhere we own: the receipt was
+                # reclaimed between the last heartbeat and settlement. The
+                # new owner settles and answers — stand down without
+                # transcript writes.
+                return None
         user_entry = {
             "role": "user",
             "content": event.text or "",

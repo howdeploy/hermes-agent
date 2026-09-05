@@ -675,6 +675,11 @@ def publish_bot_chain_history(
     db = get_shared_session_db(profile_home / "state.db")
     try:
         with acquire_turn_lock(root, profile.name):
+            if control is not None and control.cancel_event.is_set():
+                # The chain's claim was lost (or the turn was stopped) while
+                # the model turn ran: the new receipt owner publishes — this
+                # stale generation must not create/rename/write Bot Chat.
+                raise BotChainCancelled("Bot chain stopped.")
             source = db.get_session_by_title(title)
             if source is None:
                 raise RuntimeError(
@@ -685,6 +690,10 @@ def publish_bot_chain_history(
 
             canonical = db.get_session_by_title(BOT_CHAT_TITLE)
             if canonical is None:
+                if control is not None and control.cancel_event.is_set():
+                    # Re-checked under the DB lock, immediately before the
+                    # first mutation (receipt stamp + rename into Bot Chat).
+                    raise BotChainCancelled("Bot chain stopped.")
                 # The rename retires the chain-titled session, so the exact
                 # chain identity must survive on the message rows themselves:
                 # recovery from Bot Chat is keyed by that receipt, never by
@@ -781,6 +790,10 @@ def publish_bot_chain_history(
             try:
                 # A normal inbound delivery reopens the canonical conversation;
                 # the transcript projection must have the same lifecycle shape.
+                if control is not None and control.cancel_event.is_set():
+                    # Claim lost while waiting on the canonical chat's turn
+                    # lease: no stale append under the new owner's receipt.
+                    raise BotChainCancelled("Bot chain stopped.")
                 db.reopen_session(canonical_tip_id)
                 db.append_messages_batch(
                     canonical_tip_id,
@@ -838,12 +851,19 @@ class FallbackBotTurnExecutor:
                 conversation_name=conversation_name,
             )
         if self.history_publisher is not None:
+            if control.cancel_event.is_set():
+                # The execution claim was lost mid-turn (or the chain was
+                # stopped): the receipt's new owner publishes — never project
+                # a stale generation's output into the canonical Bot Chat.
+                raise BotChainCancelled("Bot chain stopped.")
             try:
                 self.history_publisher(
                     profile,
                     conversation_name,
                     control=control,
                 )
+            except BotChainCancelled:
+                raise
             except Exception:
                 # The model turn already completed and is durable in its
                 # isolated Bot Chain session. Never report the whole turn as

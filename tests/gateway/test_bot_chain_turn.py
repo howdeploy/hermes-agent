@@ -27,6 +27,7 @@ class _AsyncStore:
         self.appended = []
         self.updated = []
         self.admissions = {}
+        self.chain_names = {}
         self.settlements = []
         self.fail_user_append = False
 
@@ -35,17 +36,32 @@ class _AsyncStore:
 
     async def admit_bot_chain_delivery(self, session_id, message_id, chain_name):
         key = (session_id, message_id)
+        # The first admission binds the chain identity; later deliveries
+        # reuse it and never overwrite it.
+        self.chain_names.setdefault(key, chain_name)
         if key in self.admissions:
             return self.admissions[key]
         self.admissions[key] = "admitted"
         return "admitted"
 
-    async def mark_bot_chain_delivery_running(self, session_id, message_id):
-        return True
+    async def get_bot_chain_delivery(self, session_id, message_id):
+        key = (session_id, message_id)
+        if key not in self.admissions:
+            return None
+        return {
+            "chain_name": self.chain_names.get(key),
+            "state": self.admissions[key],
+        }
 
-    async def settle_bot_chain_delivery(self, session_id, message_id, *, outcome, detail=""):
+    async def mark_bot_chain_delivery_running(self, session_id, message_id):
+        return "claim-token"
+
+    async def settle_bot_chain_delivery(
+        self, session_id, message_id, *, outcome, detail="", owner_token=None
+    ):
         self.admissions[(session_id, message_id)] = "settled"
         self.settlements.append((session_id, message_id, outcome))
+        return True
 
     async def append_to_transcript(self, session_id, message):
         if self.fail_user_append and message.get("role") == "user":
@@ -73,20 +89,25 @@ class _DurableAsyncStore(_AsyncStore):
         return self.db.mark_bot_chain_delivery_running(session_id, message_id)
 
     async def settle_bot_chain_delivery(
-        self, session_id, message_id, *, outcome, detail=""
+        self, session_id, message_id, *, outcome, detail="", owner_token=None
     ):
         return self.db.settle_bot_chain_delivery(
             session_id,
             message_id,
             outcome=outcome,
             detail=detail,
+            owner_token=owner_token,
         )
 
     async def get_bot_chain_delivery(self, session_id, message_id):
         return self.db.get_bot_chain_delivery(session_id, message_id)
 
-    async def release_bot_chain_delivery_claim(self, session_id, message_id):
-        return self.db.release_bot_chain_delivery_claim(session_id, message_id)
+    async def release_bot_chain_delivery_claim(
+        self, session_id, message_id, owner_token=None
+    ):
+        return self.db.release_bot_chain_delivery_claim(
+            session_id, message_id, owner_token
+        )
 
     async def append_to_transcript(self, session_id, message):
         if self.fail_user_append and message.get("role") == "user":
@@ -615,12 +636,15 @@ def test_gateway_settlement_failure_releases_claim_and_redelivery_recovers(
     real_settle = store.settle_bot_chain_delivery
     settle_attempts = []
 
-    async def _flaky_settle(session_id, message_id, *, outcome, detail=""):
+    async def _flaky_settle(
+        session_id, message_id, *, outcome, detail="", owner_token=None
+    ):
         settle_attempts.append(message_id)
         if len(settle_attempts) <= 2:
             raise OSError("state.db wedged")
         return await real_settle(
-            session_id, message_id, outcome=outcome, detail=detail
+            session_id, message_id, outcome=outcome, detail=detail,
+            owner_token=owner_token,
         )
 
     store.settle_bot_chain_delivery = _flaky_settle
@@ -815,12 +839,15 @@ def test_gateway_redelivery_with_receipt_bypasses_legacy_transcript_dedupe(
     real_settle = store.settle_bot_chain_delivery
     settle_attempts = []
 
-    async def _flaky_settle(session_id, message_id, *, outcome, detail=""):
+    async def _flaky_settle(
+        session_id, message_id, *, outcome, detail="", owner_token=None
+    ):
         settle_attempts.append(message_id)
         if len(settle_attempts) <= 2:
             raise OSError("state.db wedged")
         return await real_settle(
-            session_id, message_id, outcome=outcome, detail=detail
+            session_id, message_id, outcome=outcome, detail=detail,
+            owner_token=owner_token,
         )
 
     store.settle_bot_chain_delivery = _flaky_settle
@@ -879,5 +906,243 @@ def test_gateway_redelivery_with_receipt_bypasses_legacy_transcript_dedupe(
         assert receipt["state"] == "settled"
         assert receipt["outcome"] == "completed"
         assert receipt["chain_name"] == chain_name
+    finally:
+        db.close()
+
+
+def test_gateway_redelivery_reclaims_expired_foreign_generation_and_recovers(
+    tmp_path, monkeypatch
+):
+    """A ``running`` claim left by a PRIOR runtime generation — a host
+    identity the current process can never probe (container replaced,
+    machine renamed, state directory restored) — becomes reclaimable once
+    its lease expires. The redelivery resumes under the original chain
+    identity, recovers the durable step output WITHOUT re-running the
+    model turn, and settles the receipt."""
+    db = SessionDB(tmp_path / "ingress.db")
+    db.create_session("session-1", source="telegram")
+    conversation_name = "Bot Chain stale-generation"
+    assert (
+        db.admit_bot_chain_delivery("session-1", "telegram-stale", conversation_name)
+        == "admitted"
+    )
+    old_token = db.mark_bot_chain_delivery_running(
+        "session-1", "telegram-stale", lease_seconds=-1
+    )
+    assert old_token
+    # The recording runtime is gone for good and unprobeable from here.
+    import sqlite3
+
+    with sqlite3.connect(db.db_path) as conn:
+        conn.execute(
+            "UPDATE bot_chain_deliveries SET owner_host = 'gone-host', "
+            "owner_pid = -1 WHERE session_id = 'session-1' AND "
+            "platform_message_id = 'telegram-stale'"
+        )
+    receipt = db.get_bot_chain_delivery("session-1", "telegram-stale")
+    assert receipt["state"] == "running"
+
+    profile = _profile(tmp_path)
+    _persist_completed_bot_turn(
+        profile,
+        conversation_name,
+        "do the task",
+        "durable answer",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.bot_profiles.resolve_bot_chain",
+        lambda _names: [profile],
+    )
+    model_turns = []
+
+    class _ForbiddenTurn:
+        def __call__(self, *_args, **_kwargs):
+            model_turns.append(True)
+            raise AssertionError("a durable completed turn must not run again")
+
+    monkeypatch.setattr(
+        "agent.bot_chain.default_bot_turn_executor",
+        lambda: _ForbiddenTurn(),
+    )
+
+    store = _DurableAsyncStore(db)
+    runner = _wire_runner(monkeypatch, store)
+    event = SimpleNamespace(
+        text="$worker do the task",
+        message_id="telegram-stale",
+        internal=False,
+    )
+    session = SimpleNamespace(
+        session_id="session-1",
+        session_key="telegram:chat-7:31",
+    )
+    try:
+        response = asyncio.run(
+            runner._handle_bot_chain_turn(
+                event,
+                session,
+                session.session_key,
+                parse_bot_chain_message(event.text),
+            )
+        )
+
+        assert response == "$worker (final):\ndurable answer"
+        assert model_turns == []
+        receipt = db.get_bot_chain_delivery("session-1", "telegram-stale")
+        assert receipt["state"] == "settled"
+        assert receipt["outcome"] == "completed"
+        # Resumed under the original chain identity, owned by the NEW claim.
+        assert receipt["chain_name"] == conversation_name
+        assert receipt["owner_token"] != old_token
+    finally:
+        db.close()
+
+
+def test_gateway_claim_loss_mid_turn_cancels_and_stands_down(
+    tmp_path, monkeypatch
+):
+    """When the execution claim is reclaimed mid-turn — a concurrent
+    redelivery really takes over the receipt under a NEW owner_token — the
+    stale owner cancels the chain, does not settle, writes no transcript
+    rows, and returns no response. The REAL canonical-history publisher
+    (publish_bot_chain_history, not a stub) must refuse to create/rename
+    Bot Chat or publish the stale generation's output."""
+    db = SessionDB(tmp_path / "ingress.db")
+    db.create_session("session-1", source="telegram")
+
+    profile = _profile(tmp_path)
+    monkeypatch.setattr(
+        "hermes_cli.bot_profiles.resolve_bot_chain",
+        lambda _names: [profile],
+    )
+    # Test-scale lease so the heartbeat fires immediately.
+    monkeypatch.setattr(SessionDB, "BOT_CHAIN_CLAIM_LEASE_SECONDS", 0.3)
+
+    class _ReclaimingStore(_DurableAsyncStore):
+        def __init__(self, db):
+            super().__init__(db)
+            self.reclaimed_token = None
+
+        async def renew_bot_chain_delivery_claim(
+            self, session_id, message_id, owner_token
+        ):
+            if self.reclaimed_token is None:
+                # A concurrent redelivery reclaims the claim for real: force
+                # the lease expired, resume the admission, and win the fresh
+                # claim under a new owner_token.
+                import sqlite3
+
+                with sqlite3.connect(self.db.db_path) as conn:
+                    conn.execute(
+                        "UPDATE bot_chain_deliveries SET lease_expires_at = 0 "
+                        "WHERE session_id = ? AND platform_message_id = ?",
+                        (session_id, message_id),
+                    )
+                assert (
+                    self.db.admit_bot_chain_delivery(
+                        session_id, message_id, "ignored-replacement-name"
+                    )
+                    == "admitted"
+                )
+                self.reclaimed_token = self.db.mark_bot_chain_delivery_running(
+                    session_id, message_id
+                )
+                assert self.reclaimed_token
+                assert self.reclaimed_token != owner_token
+            return self.db.renew_bot_chain_delivery_claim(
+                session_id, message_id, owner_token
+            )
+
+    store = _ReclaimingStore(db)
+    publish_attempts = []
+
+    def _execute(profile, prompt, control, *, conversation_name):
+        # A slow in-flight model turn: it must observe the cancellation.
+        assert control.cancel_event.wait(timeout=30), (
+            "claim loss must cancel the running chain"
+        )
+        # The stale worker still holds its model output: durable rows exist
+        # in the isolated chain session, and the turn reaches for the real
+        # canonical-history publisher with the claim already lost.
+        isolated_db = SessionDB(Path(profile.path) / "state.db")
+        try:
+            isolated_db.create_session(
+                "chain-session",
+                source="cli",
+                model=profile.model,
+                profile_name=profile.name,
+            )
+            isolated_db.set_session_title("chain-session", conversation_name)
+            isolated_db.append_messages_batch(
+                "chain-session",
+                [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "stale output"},
+                ],
+            )
+        finally:
+            isolated_db.close()
+        publish_attempts.append(conversation_name)
+        with pytest.raises(BotChainCancelled):
+            publish_bot_chain_history(profile, conversation_name, control=control)
+        raise BotChainCancelled("Bot chain stopped.")
+
+    monkeypatch.setattr(
+        "agent.bot_chain.default_bot_turn_executor",
+        lambda: _execute,
+    )
+
+    # Real asyncio.to_thread (NOT inlined): the heartbeat task must get
+    # event-loop time while the turn runs in a worker thread.
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store._store
+    runner._async_session_store = store
+    state = SimpleNamespace(turn=SimpleNamespace(agent=None, started_ts=0.0))
+    runner._session_state = lambda _key: state
+
+    event = SimpleNamespace(
+        text="$worker do the task",
+        message_id="telegram-lost",
+        internal=False,
+    )
+    session = SimpleNamespace(
+        session_id="session-1",
+        session_key="telegram:chat-7:31",
+    )
+    try:
+        response = asyncio.run(
+            runner._handle_bot_chain_turn(
+                event,
+                session,
+                session.session_key,
+                parse_bot_chain_message(event.text),
+            )
+        )
+
+        # The stale owner answered nothing and persisted nothing.
+        assert response is None
+        assert not db.has_platform_message_id("session-1", "telegram-lost")
+        receipt = db.get_bot_chain_delivery("session-1", "telegram-lost")
+        assert receipt is not None
+        assert receipt["state"] == "running"  # left for the real owner
+        assert receipt["owner_token"] == store.reclaimed_token
+        assert receipt["outcome"] is None
+        # The real publisher stood down: Bot Chat was neither created nor
+        # renamed into, and the stale output was never projected anywhere.
+        chain_name = receipt["chain_name"]
+        assert publish_attempts == [chain_name]
+        profile_db = SessionDB(Path(profile.path) / "state.db")
+        try:
+            assert profile_db.get_session_by_title("Bot Chat") is None
+            isolated = profile_db.get_session_by_title(chain_name)
+            assert isolated is not None  # never renamed into Bot Chat
+            assert [
+                (m["role"], m["content"])
+                for m in profile_db.get_messages_as_conversation(
+                    str(isolated["id"])
+                )
+            ] == [("user", "do the task"), ("assistant", "stale output")]
+        finally:
+            profile_db.close()
     finally:
         db.close()
