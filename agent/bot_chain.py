@@ -705,7 +705,7 @@ def publish_bot_chain_history(
             if canonical is not None:
                 canonical_id = str(canonical["id"])
                 canonical_tip = db.get_compression_tip(canonical_id) or canonical_id
-                if _receipt_stamped_output(db.get_messages_as_conversation(canonical_tip), title) is not None:
+                if _published_chain_output(db, canonical_id, title) is not None:
                     return canonical_tip
             source = db.get_session_by_title(title)
             if source is None:
@@ -824,7 +824,7 @@ def publish_bot_chain_history(
                         # Claim lost while waiting on the canonical chat's turn
                         # lease: no stale append under the new owner's receipt.
                         raise BotChainCancelled("Bot chain stopped.")
-                    if _receipt_stamped_output(db.get_messages_as_conversation(canonical_tip_id), title) is not None:
+                    if _published_chain_output(db, canonical_root_id, title) is not None:
                         return canonical_tip_id
                     db.reopen_session(canonical_tip_id)
                     db.append_messages_batch(
@@ -1073,7 +1073,8 @@ def build_handoff_prompt(
 def _last_assistant_text(messages: Sequence[Mapping[str, Any]]) -> Optional[str]:
     if messages:
         message = messages[-1]
-        if message.get("role") == "assistant" and not message.get("tool_calls"):
+        if (message.get("role") == "assistant" and not message.get("tool_calls")
+                and not message.get("_compressed_summary")):
             content = str(message.get("content") or "")
             if content.strip():
                 return content
@@ -1088,7 +1089,7 @@ def _receipt_stamped_output(
 
     receipt_key = SessionDB.BOT_CHAIN_RECEIPT_METADATA_KEY
     for message in reversed(messages):
-        if message.get("role") != "assistant":
+        if message.get("role") != "assistant" or message.get("tool_calls") or message.get("_compressed_summary"):
             continue
         metadata = message.get("display_metadata")
         if not isinstance(metadata, dict):
@@ -1101,6 +1102,22 @@ def _receipt_stamped_output(
         content = str(message.get("content") or "")
         if content.strip():
             return content
+    return None
+
+
+def _published_chain_output(db, canonical_id: str, conversation_name: str) -> Optional[str]:
+    """Publication receipts survive rotation, compaction and transcript edits.
+
+    Historical rows prove an executed side effect even when no longer part of
+    the model context. Never feed these audit rows back into the conversation.
+    """
+    # ponytail: scan retained lineage; index receipts if long Bot Chats make this expensive.
+    for session_id in reversed(db.get_compression_chain(canonical_id)):
+        output = _receipt_stamped_output(
+            db.get_messages(session_id, include_inactive=True), conversation_name
+        )
+        if output is not None:
+            return output
     return None
 
 
@@ -1134,19 +1151,16 @@ def recover_durable_step_output(
         db = SessionDB(db_path, read_only=True)
         source = db.get_session_by_title(conversation_name)
         if source is not None and source.get("id"):
+            source_id = str(source["id"])
+            source_tip = db.get_compression_tip(source_id) or source_id
             recovered = _last_assistant_text(
-                db.get_messages_as_conversation(str(source["id"]))
+                db.get_messages(source_tip)
             )
             if recovered is not None:
                 return recovered
         canonical = db.get_session_by_title(BOT_CHAT_TITLE)
         if canonical is not None and canonical.get("id"):
-            canonical_id = str(canonical["id"])
-            canonical_tip = db.get_compression_tip(canonical_id) or canonical_id
-            return _receipt_stamped_output(
-                db.get_messages_as_conversation(canonical_tip),
-                conversation_name,
-            )
+            return _published_chain_output(db, str(canonical["id"]), conversation_name)
         return None
     except Exception as exc:
         logger.warning(
@@ -1196,9 +1210,18 @@ class BotChainRunner:
             )
 
         steps: list[BotChainStep] = []
+        seen_profiles: set[str] = set()
         next_input = original_prompt
         total = len(ordered)
         for index, profile in enumerate(ordered):
+            # Keep existing receipts valid for the first occurrence of a profile;
+            # later occurrences are distinct turns, not redeliveries of that turn.
+            profile_key = profile.name.casefold()
+            step_name = (
+                f"{conversation_name} / step {index + 1}"
+                if profile_key in seen_profiles else conversation_name
+            )
+            seen_profiles.add(profile_key)
             if control.cancel_event.is_set():
                 raise BotChainCancelled("Bot chain stopped.")
             with control.guard_publication():
@@ -1219,19 +1242,19 @@ class BotChainRunner:
             # is keyed by the chain identity only (session title or the
             # stamped chain receipt), never by prompt text.
             recovered = recover_durable_step_output(
-                profile, conversation_name
+                profile, step_name
             )
             if recovered is not None:
                 output = recovered
                 publish = getattr(self.turn_executor, "publish_history", None)
                 if publish is not None:
-                    publish(profile, conversation_name, control)
+                    publish(profile, step_name, control)
             else:
                 output = self.turn_executor(
                     profile,
                     next_input,
                     control,
-                    conversation_name=conversation_name,
+                    conversation_name=step_name,
                 )
             with control.guard_publication():
                 pass  # Do not emit a stale generation's result before heartbeat catches up.

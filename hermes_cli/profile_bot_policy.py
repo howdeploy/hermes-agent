@@ -16,8 +16,6 @@ def read_bot_enabled(profile_dir: Path) -> bool:
         except FileNotFoundError:
             return True
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        if data is None:
-            return True
         if not isinstance(data, dict):
             return False
         if "bot" not in data:

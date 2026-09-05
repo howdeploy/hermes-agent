@@ -23,6 +23,7 @@ from agent.bot_chain import (
     format_bot_chain_result,
     parse_bot_chain_message,
     publish_bot_chain_history,
+    recover_durable_step_output,
 )
 from hermes_cli.bot_profiles import BotProfile
 from hermes_state import SessionDB
@@ -1118,6 +1119,109 @@ def test_local_delivery_default_remains_canonical_bot_chat():
     argv = local_delivery_command("test1", "/tmp/query.txt")
 
     assert argv[argv.index("-c") + 1] == "Bot Chat"
+
+
+@pytest.mark.parametrize("publication", ["pending", "promoted", "appended"])
+@pytest.mark.parametrize("rotate", [False, True])
+def test_recovery_and_publication_survive_compression(tmp_path, publication, rotate):
+    profile = _temp_profile(tmp_path, "worker")
+    title = "Bot Chain compressed"
+    db = SessionDB(profile.path / "state.db")
+    try:
+        if publication == "appended":
+            db.create_session("canonical", source="desktop")
+            db.set_session_title("canonical", "Bot Chat")
+        db.create_session("isolated", source="cli")
+        db.set_session_title("isolated", title)
+        db.append_message("isolated", "user", "task")
+        if publication != "pending":
+            db.append_message("isolated", "assistant", "durable result")
+            session_id = publish_bot_chain_history(profile, title)
+        else:
+            session_id = "isolated"
+
+        summary = [
+            {"role": "user", "content": "compressed context"},
+            {"role": "assistant", "content": "summary, not a completed turn", "_compressed_summary": True},
+        ]
+        assert db.try_acquire_compression_lock(session_id, "test-compressor")
+        if rotate:
+            db.publish_compression_child(
+                parent_session_id=session_id, child_session_id="child", source="cli",
+                messages=summary, compression_lock_holder="test-compressor",
+            )
+            tip = "child"
+        else:
+            db.archive_and_compact(session_id, summary, lock_holder="test-compressor")
+            tip = session_id
+        db.release_compression_lock(session_id, "test-compressor")
+        if publication == "pending":
+            assert recover_durable_step_output(profile, title) is None
+            db.append_message(tip, "assistant", "durable result")
+
+        def no_execution(*args, **kwargs):
+            pytest.fail("durably completed inference must not be replayed")
+
+        executor = FallbackBotTurnExecutor(no_execution, no_execution, history_publisher=publish_bot_chain_history)
+        for _ in range(2):
+            assert recover_durable_step_output(profile, title) == "durable result"
+            result = BotChainRunner(executor).run([profile], "task", conversation_name=title)
+            assert result.final_output == "durable result"
+        canonical = db.get_session_by_title("Bot Chat")
+        rows = [message for sid in db.get_compression_chain(canonical["id"])
+                for message in db.get_messages(sid, include_inactive=True)]
+        assert sum(m["content"] == "durable result" for m in rows) == 1
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("existing_canonical", [False, True])
+def test_repeated_profile_has_distinct_recoverable_steps(tmp_path, existing_canonical):
+    writer, reviewer = _temp_profile(tmp_path, "writer"), _temp_profile(tmp_path, "reviewer")
+    if existing_canonical:
+        for profile in (writer, reviewer):
+            db = SessionDB(profile.path / "state.db")
+            db.create_session("canonical", source="desktop")
+            db.set_session_title("canonical", "Bot Chat")
+            db.close()
+    calls = []
+    def execute(profile, prompt, control, *, conversation_name):
+        calls.append((profile.name, prompt, conversation_name))
+        output = f"answer-{len(calls)}"
+        db = SessionDB(profile.path / "state.db")
+        try:
+            session_id = f"turn-{len(calls)}"
+            db.create_session(session_id, source="cli")
+            db.set_session_title(session_id, conversation_name)
+            db.append_messages_batch(session_id, [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": output},
+            ])
+        finally:
+            db.close()
+        return output
+
+    executor = FallbackBotTurnExecutor(execute, execute, history_publisher=publish_bot_chain_history)
+    runner = BotChainRunner(executor)
+    def crash_after_second_step(step, index, total):
+        if index == 1:
+            raise RuntimeError("simulated restart")
+    with pytest.raises(RuntimeError, match="simulated restart"):
+        runner.run([writer, reviewer, writer], "revise", conversation_name="Bot Chain repeated",
+                   on_step=crash_after_second_step)
+    for _ in range(2):
+        result = runner.run([writer, reviewer, writer], "revise", conversation_name="Bot Chain repeated")
+        assert [s.output for s in result.steps] == ["answer-1", "answer-2", "answer-3"]
+    assert [call[0] for call in calls] == ["writer", "reviewer", "writer"]
+    assert "answer-2" in calls[2][1]
+    assert calls[0][2] != calls[2][2]
+    db = SessionDB(writer.path / "state.db")
+    try:
+        canonical = db.get_session_by_title("Bot Chat")
+        answers = [m["content"] for m in db.get_messages(canonical["id"]) if m["role"] == "assistant"]
+        assert answers == ["answer-1", "answer-3"]
+    finally:
+        db.close()
 
 
 def test_runner_accepts_caller_supplied_conversation_name():

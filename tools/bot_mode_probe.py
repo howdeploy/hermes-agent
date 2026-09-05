@@ -73,8 +73,6 @@ def _bot_mode_config(root: Path) -> dict[str, Any] | None:
         except FileNotFoundError:
             return {}
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        if data is None:
-            return {}
         if not isinstance(data, dict):
             return None
         agent = data.get("agent", {})

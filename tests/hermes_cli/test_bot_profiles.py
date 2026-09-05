@@ -138,8 +138,9 @@ def _write_bot(home, name, *, profile_yaml=None):
     return profile_dir
 
 
-def test_read_profile_meta_missing_file_keeps_legacy_default(bot_home):
-    profile_dir = _write_bot(bot_home, "legacy")
+@pytest.mark.parametrize("metadata", [None, "{}\n", "description: legacy\n"])
+def test_read_profile_meta_no_bot_field_keeps_legacy_default(bot_home, metadata):
+    profile_dir = _write_bot(bot_home, "legacy", profile_yaml=metadata)
     assert profiles_mod.read_profile_meta(profile_dir)["bot_enabled"] is True
 
 
@@ -160,6 +161,33 @@ def test_explicit_chain_obeys_declarative_roster(bot_home, roster):
 def test_read_profile_meta_corrupt_yaml_fails_closed(bot_home):
     profile_dir = _write_bot(bot_home, "broken", profile_yaml="bot: [unclosed\n")
     assert profiles_mod.read_profile_meta(profile_dir)["bot_enabled"] is False
+
+
+@pytest.mark.parametrize("replacement", ["", "null\n", "# interrupted write\n"])
+def test_indeterminate_metadata_does_not_enable_disabled_bot(bot_home, replacement):
+    from tools.bot_mode_probe import allowed_local_profile_names
+
+    directory = _write_bot(bot_home, "worker", profile_yaml="bot:\n  enabled: false\n")
+    assert get_bot_profile("worker").enabled is False
+    (directory / "profile.yaml").write_text(replacement, encoding="utf-8")
+    assert get_bot_profile("worker").enabled is False
+    assert "worker" not in allowed_local_profile_names(bot_home)
+    with pytest.raises(ValueError, match="disabled"):
+        resolve_bot_chain(["worker"])
+
+
+@pytest.mark.parametrize("replacement", ["", "null\n", "# interrupted write\n"])
+def test_indeterminate_config_keeps_roster_fail_closed(bot_home, replacement):
+    from tools.bot_mode_probe import allowed_local_profile_names
+
+    _write_bot(bot_home, "worker")
+    path = bot_home / "config.yaml"
+    path.write_text("agent:\n  bot_mode:\n    enabled: true\n    roster: []\n", encoding="utf-8")
+    assert "worker" not in allowed_local_profile_names(bot_home)
+    path.write_text(replacement, encoding="utf-8")
+    assert "worker" not in allowed_local_profile_names(bot_home)
+    with pytest.raises(ValueError, match="not allowed"):
+        resolve_bot_chain(["worker"])
 
 
 def test_read_profile_meta_non_mapping_document_fails_closed(bot_home):
