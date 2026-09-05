@@ -115,6 +115,10 @@ def ensure_message_agent_tool(agent: Any) -> bool:
         from tools.bot_mode_probe import bot_mode_session_state
 
         if not bot_mode_session_state(agent)["session_kind"]:
+            if isinstance(getattr(agent, "tools", None), list):
+                agent.tools[:] = [t for t in agent.tools if t.get("function", {}).get("name") != MESSAGE_AGENT_TOOL_NAME]
+            if isinstance(getattr(agent, "valid_tool_names", None), set):
+                agent.valid_tool_names.discard(MESSAGE_AGENT_TOOL_NAME)
             return False
         tools = getattr(agent, "tools", None)
         if tools and any(
@@ -142,10 +146,15 @@ def _resolve_local_name(target: str, roster: list[str]) -> Optional[str]:
     return next((name for name in roster if name.lower() == want), None) if want else None
 
 
-def _err(message: str, *, roster: list[str] | None = None, peers: list[str] | None = None) -> str:
+def _err(
+    message: str, *, roster: list[str] | None = None, peers: list[str] | None = None
+) -> str:
     from tools.bot_failure_reasons import classify_agent_error
 
-    payload: dict[str, Any] = {"error": message, "reason": classify_agent_error(message)}
+    payload: dict[str, Any] = {
+        "error": message,
+        "reason": classify_agent_error(message),
+    }
     if roster is not None:
         payload["teammates"] = roster
     if peers is not None:
@@ -167,7 +176,7 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
         state = bot_mode_session_state(agent)
         if not state["session_kind"] or not bot_mode_dispatch_authorized(agent, home):
             return _err(
-                "message_agent is only available in a Bot Mode session — a canonical "
+                "message_agent is not available in this session. It requires a Bot Mode session — a canonical "
                 "'Bot Chat' or a classified human messaging chat bound to a real profile. "
                 "This session is not one; do not retry."
             )
@@ -177,7 +186,13 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
     root, me = _hermes_root(Path(home)), _self_profile_name(Path(home))
     roster = [name for name, _dir in _roster(root)]
     peers = _peers(root)
-    teammates = [_handle(n) for n in roster if n != me]
+    try:
+        from tools.bot_mode_probe import allowed_local_profile_names
+
+        allowed_local = allowed_local_profile_names(home)
+    except Exception:
+        allowed_local = []
+    teammates = [_handle(n) for n in allowed_local]
 
     def _roster_err(msg: str) -> str:
         return _err(msg, roster=teammates, peers=peers)
@@ -189,7 +204,7 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
         return _err(f"message too long ({len(body)} chars > {MESSAGE_MAX_CHARS}). "
                     "Send the essentials; share large content as a file path instead.")
 
-    raw_target = str(target or "").strip().lstrip("@")
+    raw_target = str(target or "").strip().lstrip("@$")
     if not raw_target:
         return _roster_err("target is required.")
     content = f"Message from 🤖 {_handle(me)} (@{_handle(me)}): " + body
@@ -213,6 +228,9 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
     if not is_local_shape and "@" not in raw_target:
         return _roster_err(f"Invalid target: {raw_target!r}.")
     resolved = _resolve_local_name(raw_target, roster) if is_local_shape else None
+    if resolved is not None and resolved != me and resolved not in allowed_local:
+        return _roster_err(f"'{raw_target}' is not callable from this profile: bot.disabled, "
+                           "unreadable metadata, or configured roster restriction.")
     if resolved is None or resolved == me:
         # Unknown locally, or same-name target on ANOTHER connection (this gateway's 'default'
         # messaging the cloud 'default'): every Desktop-connected gateway is reachable via the

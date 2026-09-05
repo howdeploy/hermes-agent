@@ -593,6 +593,7 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str) -> bool:
         from tools.bot_mode_probe import (
             bot_mode_session_state,
             stored_bot_chat_prompt_needs_upgrade,
+            stored_bot_mode_user_prompt_needs_upgrade,
             stored_prompt_capability_stale,
             stored_prompt_has_bot_mode_protocol,
         )
@@ -602,14 +603,16 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str) -> bool:
             home = _agent_home(agent)
         except Exception:
             pass
-        routed = bool(bot_mode_session_state(agent)["session_kind"])
+        kind = bot_mode_session_state(agent)["session_kind"]
+        routed = bool(kind)
         if not routed and stored_prompt_has_bot_mode_protocol(stored_prompt):
             return True
         if not routed:
             return False
         return bool(
             stored_prompt_capability_stale(stored_prompt, home)
-            or stored_bot_chat_prompt_needs_upgrade(stored_prompt, home)
+            or (stored_bot_chat_prompt_needs_upgrade(stored_prompt, home) if kind in {"bot_chat", "gateway"}
+                else stored_bot_mode_user_prompt_needs_upgrade(stored_prompt, home))
         )
     except Exception:
         return False

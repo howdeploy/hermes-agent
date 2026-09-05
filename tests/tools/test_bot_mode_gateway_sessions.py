@@ -61,7 +61,7 @@ BUNDLED_MESSAGING_SOURCES = (
 )
 BUNDLED_DENIED_SOURCES = ("a2a", "homeassistant", "ntfy", "raft")
 SELF_OWNED_SOURCES = (
-    "", "cli", "tui", "desktop", "cron", "kanban", "subagent", "test",
+    "tui", "desktop", "cron", "kanban", "subagent", "test",
     "webhook", "api_server", "msgraph_webhook", "local", "acp", "webui",
 )
 CANONICAL_BOT_CHAT_SOURCES = ("", "cli", "tui", "desktop")
@@ -123,6 +123,7 @@ class _FakeAgent:
         self._session_title_hint = None
         self._bot_mode_protocol = True
         self.platform = platform
+        self._gateway_session_key = f"test:{platform}:{session_id}" if platform == "telegram" else None
         self.tools: list = []
         self.valid_tool_names: set = set()
         # attributes the real system-prompt build reads
@@ -665,11 +666,10 @@ def test_e2e_system_prompt_carries_protocol_for_discord_session(tmp_path, monkey
     assert "## Messaging other agents" not in prompt3
     assert stranger.tools == []
 
-    # self-owned CLI session on the MANAGED install: nothing (ambient gateway
-    # home still differs from the routed profile home).
+    # #100758 includes interactive CLI on the same routed profile.
     monkeypatch.setenv("HERMES_HOME", str(home))
     cli_agent = _FakeAgent(yuki_home, title="My session", platform="cli")
     cli_prompt = build_system_prompt(cli_agent)
-    assert bot_mode_dm.ensure_message_agent_tool(cli_agent) is False
-    assert "## Messaging other agents" not in cli_prompt
-    assert cli_agent.tools == []
+    assert bot_mode_dm.ensure_message_agent_tool(cli_agent) is True
+    assert "## Bot Mode: messaging other agents" in cli_prompt
+    assert [t["function"]["name"] for t in cli_agent.tools] == [bot_mode_dm.MESSAGE_AGENT_TOOL_NAME]

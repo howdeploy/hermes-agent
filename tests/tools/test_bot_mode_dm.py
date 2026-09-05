@@ -214,6 +214,62 @@ def test_never_injects_on_unmanaged_install(tmp_path):
     assert agent.tools == []
 
 
+def test_config_enabled_injects_message_agent_without_ui_meta(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    researcher = home / "profiles" / "researcher"
+    researcher.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        textwrap.dedent(
+            """\
+            agent:
+              bot_mode:
+                enabled: true
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    agent = _FakeAgent(home, title="Bot Chat")
+
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is True
+    assert [t["function"]["name"] for t in agent.tools] == [
+        bot_mode_dm.MESSAGE_AGENT_TOOL_NAME
+    ]
+
+
+def test_config_roster_rejects_unlisted_local_teammate(tmp_path, monkeypatch):
+    calls = _capture_spawn(monkeypatch)
+    home = _managed_home(tmp_path, teammates=("researcher", "coder"))
+    (home / "config.yaml").write_text(
+        textwrap.dedent(
+            """\
+            agent:
+              bot_mode:
+                enabled: true
+                roster:
+                  - from: default
+                    to: [coder]
+            """
+        ),
+        encoding="utf-8",
+    )
+    agent = _FakeAgent(home, title="Bot Chat")
+
+    denied = json.loads(
+        bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent)
+    )
+    assert "error" in denied
+    assert denied["teammates"] == ["coder"]
+    assert calls == []
+
+    allowed = json.loads(
+        bot_mode_dm.message_agent_tool(target="coder", message="hi", agent=agent)
+    )
+    assert allowed["status"] == "sent"
+    assert len(calls) == 1
+
+
 def test_config_toggle_disables_injection(tmp_path):
     home = _managed_home(tmp_path)
     agent = _FakeAgent(home, title="Bot Chat")
@@ -372,6 +428,32 @@ def test_tool_refuses_on_unmanaged_install(tmp_path):
 # ── target validation ────────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("platform,title", [("cli", "Project"), ("telegram", "Project"), ("desktop", "Bot Chat")])
+@pytest.mark.parametrize("config", [
+    "agent:\n  bot_mode:\n    enabled: false\n",
+    "agent:\n  bot_mode:\n    enabled: true\n    roster: bad\n",
+    "agent:\n  bot_mode:\n    enabled: true\n    roster: null\n",
+    "agent:\n  bot_mode:\n    enabled: true\n    roster: []\n",
+    "agent: [unclosed\n",
+])
+def test_live_root_policy_revokes_delivery_on_every_surface(tmp_path, monkeypatch, platform, title, config):
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title=title, platform=platform, gateway_session_key="telegram:test")
+    assert bot_mode_dm.ensure_message_agent_tool(agent)
+    (home / "config.yaml").write_text(config, encoding="utf-8")
+    assert bot_mode_probe.allowed_local_profile_names(home) == []
+    for section in (
+        bot_mode_probe.get_bot_mode_protocol_section(home, force_refresh=True),
+        bot_mode_probe.get_bot_mode_user_protocol_section(home, force_refresh=True, platform=platform),
+    ):
+        assert "`@researcher`" not in section and "`$researcher`" not in section
+    def no_spawn(*args, **kwargs):
+        pytest.fail("revoked policy must not start delivery")
+    monkeypatch.setattr(bot_mode_dm, "_spawn_delivery", no_spawn)
+    result = json.loads(bot_mode_dm.message_agent_tool(target="researcher", message="blocked", agent=agent))
+    assert "error" in result
+
+
 def test_unknown_target_lists_roster(tmp_path):
     home = _managed_home(tmp_path, teammates=("researcher", "coder"))
     agent = _FakeAgent(home, title="Bot Chat")
@@ -434,7 +516,9 @@ def test_unregistered_peer_rejected(tmp_path):
     home = _managed_home(tmp_path, peers=("spark",))
     agent = _FakeAgent(home, title="Bot Chat")
     result = json.loads(
-        bot_mode_dm.message_agent_tool(target="homelab/coder", message="hi", agent=agent)
+        bot_mode_dm.message_agent_tool(
+            target="homelab/coder", message="hi", agent=agent
+        )
     )
     assert "error" in result
     assert result["peers"] == ["spark"]
@@ -448,7 +532,10 @@ def _capture_spawn(monkeypatch):
 
     def fake_terminal_tool(command, **kwargs):
         calls.append({"command": command, **kwargs})
-        return json.dumps({"output": "Background process started", "session_id": "proc_test1234"})
+        return json.dumps({
+            "output": "Background process started",
+            "session_id": "proc_test1234",
+        })
 
     import tools.terminal_tool as terminal_tool_module
 
@@ -510,7 +597,7 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     # attribution prefix applied server-side; body verbatim inside the file
     content = Path(dm_file).read_text(encoding="utf-8")
     assert content.startswith("Message from 🤖 hermes (@hermes): ")
-    assert '$(and this is not shell)' in content
+    assert "$(and this is not shell)" in content
 
 
 def test_peer_delivery_command_pins_registry_profile_for_secondary_bots(
@@ -551,13 +638,22 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
     agent = _FakeAgent(home, title="Bot Chat")
 
     result = json.loads(
-        bot_mode_dm.message_agent_tool(target="spark/researcher", message="ping", agent=agent)
+        bot_mode_dm.message_agent_tool(
+            target="spark/researcher", message="ping", agent=agent
+        )
     )
     assert result["status"] == "sent"
     assert "spark" in result["to"]
     mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
     assert mode == "stdin"
-    assert transport_argv == ["hermes", "-p", "default", "peer", "dm", "spark/researcher"]
+    assert transport_argv == [
+        "hermes",
+        "-p",
+        "default",
+        "peer",
+        "dm",
+        "spark/researcher",
+    ]
 
     # bare peer name targets the peer's main agent
     result2 = json.loads(
@@ -581,8 +677,10 @@ def test_named_profile_sender_prefix(tmp_path, monkeypatch):
     )
     assert result["status"] == "sent"
     _mode, dm_file, _transport_argv = _runner_parts(calls[0]["command"])
-    assert Path(dm_file).read_text(encoding="utf-8").startswith(
-        "Message from 🤖 coder (@coder): "
+    assert (
+        Path(dm_file)
+        .read_text(encoding="utf-8")
+        .startswith("Message from 🤖 coder (@coder): ")
     )
 
 
@@ -723,7 +821,9 @@ def test_query_file_delivery_closes_stdin_for_initial_attempt_and_retry(
     assert not dm_file.exists()
 
 
-@pytest.mark.parametrize("args", [[], ["--run-delivery"], ["--run-delivery", "bad", "x"]])
+@pytest.mark.parametrize(
+    "args", [[], ["--run-delivery"], ["--run-delivery", "bad", "x"]]
+)
 def test_delivery_main_rejects_invalid_cli(args):
     assert bot_mode_dm._delivery_main(args) == 2
 
@@ -743,17 +843,15 @@ def test_delivery_main_runs_valid_cli_and_unlinks(tmp_path, mode):
     )
     source_arg = "-" if mode == "stdin" else str(dm_file)
 
-    returncode = bot_mode_dm._delivery_main(
-        [
-            "--run-delivery",
-            mode,
-            str(dm_file),
-            sys.executable,
-            str(child),
-            source_arg,
-            str(observed),
-        ]
-    )
+    returncode = bot_mode_dm._delivery_main([
+        "--run-delivery",
+        mode,
+        str(dm_file),
+        sys.executable,
+        str(child),
+        source_arg,
+        str(observed),
+    ])
 
     assert returncode == 0
     assert observed.read_text(encoding="utf-8") == "secret"
@@ -769,9 +867,12 @@ def test_delivery_main_maps_launch_exception_to_one_and_unlinks(tmp_path, monkey
 
     monkeypatch.setattr(subprocess, "run", boom)
     assert (
-        bot_mode_dm._delivery_main(
-            ["--run-delivery", "query-file", str(dm_file), "missing-transport"]
-        )
+        bot_mode_dm._delivery_main([
+            "--run-delivery",
+            "query-file",
+            str(dm_file),
+            "missing-transport",
+        ])
         == 1
     )
     assert not dm_file.exists()
@@ -887,7 +988,9 @@ def test_successful_spawn_transfers_cleanup_to_runner(tmp_path, monkeypatch):
     )
 
     assert result["status"] == "sent"
-    assert dm_file.exists(), "the parent must not delete before the background runner reads"
+    assert dm_file.exists(), (
+        "the parent must not delete before the background runner reads"
+    )
 
 
 def test_write_dm_file_unlinks_partial_file_on_write_exception(tmp_path, monkeypatch):
@@ -909,7 +1012,9 @@ def test_write_dm_file_unlinks_partial_file_on_write_exception(tmp_path, monkeyp
             raise OSError("disk full")
 
     monkeypatch.setattr(bot_mode_dm.tempfile, "mkstemp", fixed_mkstemp)
-    monkeypatch.setattr(bot_mode_dm.os, "fdopen", lambda *args, **kwargs: BrokenWriter())
+    monkeypatch.setattr(
+        bot_mode_dm.os, "fdopen", lambda *args, **kwargs: BrokenWriter()
+    )
 
     with pytest.raises(OSError, match="disk full"):
         bot_mode_dm._write_dm_file("secret")
@@ -943,7 +1048,8 @@ def test_dm_dir_is_private_and_uid_scoped_on_posix(tmp_path, monkeypatch):
     dm_dir = bot_mode_dm._dm_dir()
 
     if hasattr(os, "getuid"):
-        assert dm_dir.name == f"{bot_mode_dm._DM_DIR_NAME}-{os.getuid()}"
+        uid = os.getuid()  # windows-footgun: ok
+        assert dm_dir.name == f"{bot_mode_dm._DM_DIR_NAME}-{uid}"
     else:
         assert dm_dir.name == bot_mode_dm._DM_DIR_NAME
     assert dm_dir.stat().st_mode & 0o777 == 0o700
@@ -952,7 +1058,11 @@ def test_dm_dir_is_private_and_uid_scoped_on_posix(tmp_path, monkeypatch):
 def test_dm_dir_repairs_restrictive_owner_mode(tmp_path, monkeypatch):
     monkeypatch.setattr(bot_mode_dm.tempfile, "gettempdir", lambda: str(tmp_path))
     uid = os.getuid() if hasattr(os, "getuid") else None
-    dirname = f"{bot_mode_dm._DM_DIR_NAME}-{uid}" if uid is not None else bot_mode_dm._DM_DIR_NAME
+    dirname = (
+        f"{bot_mode_dm._DM_DIR_NAME}-{uid}"
+        if uid is not None
+        else bot_mode_dm._DM_DIR_NAME
+    )
     dm_dir = tmp_path / dirname
     dm_dir.mkdir(mode=0o500)
     dm_dir.chmod(0o500)
@@ -965,7 +1075,8 @@ def test_dm_dir_repairs_restrictive_owner_mode(tmp_path, monkeypatch):
 def test_dm_dir_rejects_precreated_symlink(tmp_path, monkeypatch):
     target = tmp_path / "attacker-controlled"
     target.mkdir()
-    expected = tmp_path / f"{bot_mode_dm._DM_DIR_NAME}-{os.getuid()}"
+    uid = os.getuid()  # windows-footgun: ok
+    expected = tmp_path / f"{bot_mode_dm._DM_DIR_NAME}-{uid}"
     expected.symlink_to(target, target_is_directory=True)
     monkeypatch.setattr(bot_mode_dm.tempfile, "gettempdir", lambda: str(tmp_path))
 
@@ -988,7 +1099,7 @@ def test_enabled_local_roster_fails_closed_on_unreadable_metadata(tmp_path):
         "bot: [unclosed\n", encoding="utf-8"
     )
 
-    assert bot_mode_dm._enabled_local_roster(home) == ["default", "writer"]
+    assert bot_mode_probe.allowed_local_profile_names(home) == ["writer"]
 
 
 def test_local_delivery_accepts_dollar_sigil_target(tmp_path, monkeypatch):

@@ -123,8 +123,8 @@ class TestStoredPromptReuse:
 
         with (
             patch(
-                "tools.bot_mode_dm.message_agent_session_kind",
-                return_value="user",
+                "tools.bot_mode_probe.bot_mode_session_state",
+                return_value={"managed": True, "session_kind": "user"},
             ),
             patch(
                 "tools.bot_mode_probe.stored_prompt_capability_stale",
@@ -284,7 +284,7 @@ class TestBotModeGatewayPromptRestore:
 
     @pytest.mark.parametrize(
         ("roster_profile", "platform"),
-        ((False, "discord"), (True, "cli"), (True, "not-a-platform")),
+        ((False, "discord"), (True, "desktop"), (True, "not-a-platform")),
     )
     def test_stale_prompt_does_not_migrate_denied_session(
         self, tmp_path, monkeypatch, roster_profile, platform

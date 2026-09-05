@@ -315,9 +315,16 @@ def _bot_mode_parts(agent: Any) -> List[str]:
     """Bot Mode protocol for canonical Bot Chats and routed human messaging sessions."""
     parts: List[str] = []
     try:
-        from tools.bot_mode_probe import bot_mode_session_state, epoch_line, get_bot_mode_protocol_section
-        if bot_mode_session_state(agent)["session_kind"]:
-            _bot_section = get_bot_mode_protocol_section(_agent_home(agent))
+        from tools.bot_mode_probe import (
+            _session_source, bot_mode_session_state, epoch_line,
+            get_bot_mode_protocol_section, get_bot_mode_user_protocol_section,
+        )
+        kind = bot_mode_session_state(agent)["session_kind"]
+        if kind:
+            _bot_section = (
+                get_bot_mode_protocol_section(_agent_home(agent)) if kind == "bot_chat" or kind == "gateway" and _session_source(agent) != "telegram"
+                else get_bot_mode_user_protocol_section(_agent_home(agent), platform=_session_source(agent))
+            )
             if _bot_section:
                 parts.append(_bot_section)
                 # Capability epoch lets the restore path rebuild ONCE per

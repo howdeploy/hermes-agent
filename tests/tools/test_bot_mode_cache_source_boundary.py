@@ -189,14 +189,13 @@ def test_authoritative_task_source_overrides_cli_platform(tmp_path, monkeypatch)
     assert dispatched is False
 
 
-def test_same_agent_source_change_denies_dispatch_without_schema_churn(
+def test_same_agent_source_change_revokes_schema_and_dispatch(
     tmp_path, monkeypatch
 ):
-    """Source trust may tighten, but a live tool list stays byte-stable."""
+    """Crossing a source trust boundary revokes both schema and dispatch."""
     _yuki_home, _Agent = _persisted_session(tmp_path)
     agent = _Agent("cli", "Bot Chat")
     assert bot_mode_dm.ensure_message_agent_tool(agent) is True
-    schema = json.dumps(agent.tools, sort_keys=True)
     dispatched = False
 
     def fake_spawn(*args, **kwargs):
@@ -208,7 +207,8 @@ def test_same_agent_source_change_denies_dispatch_without_schema_churn(
     tokens = set_session_vars(source="tool")
     try:
         assert bot_mode_dm.ensure_message_agent_tool(agent) is False
-        assert json.dumps(agent.tools, sort_keys=True) == schema
+        assert agent.tools == []
+        assert bot_mode_dm.MESSAGE_AGENT_TOOL_NAME not in agent.valid_tool_names
         result = json.loads(
             bot_mode_dm.message_agent_tool(target="coder", message="blocked", agent=agent)
         )
