@@ -65,26 +65,12 @@ def _profile_name(home: Path) -> str:
 def _bot_mode_config(root: Path) -> dict[str, Any] | None:
     """Root declarative policy; missing is legacy, unreadable is denied."""
     import yaml
+    from hermes_cli.config import InvalidUserConfigError
+    from hermes_cli.config_bot_mode import load_bot_mode_config
 
     try:
-        path = root / "config.yaml"
-        try:
-            path.lstat()
-        except FileNotFoundError:
-            return {}
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return None
-        agent = data.get("agent", {})
-        if not isinstance(agent, dict):
-            return None
-        config = agent.get("bot_mode", {})
-        if not isinstance(config, dict):
-            return None
-        if "enabled" in config and not isinstance(config["enabled"], bool):
-            return None
-        return config
-    except (OSError, UnicodeError, yaml.YAMLError):
+        return load_bot_mode_config(root)
+    except (OSError, UnicodeError, yaml.YAMLError, InvalidUserConfigError):
         return None
 
 

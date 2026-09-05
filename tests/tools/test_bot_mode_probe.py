@@ -175,6 +175,84 @@ def test_config_roster_limits_local_teammates(tmp_path):
     assert bot_mode_probe.allowed_local_profile_names(home) == ["coder"]
 
 
+@pytest.mark.parametrize("source", ["default", "caller"])
+@pytest.mark.parametrize("root_config", [False, True])
+def test_live_policy_uses_explicit_root_and_managed_env_refs(tmp_path, monkeypatch, source, root_config):
+    home = tmp_path / "install"
+    home.mkdir()
+    for name in ("caller", "coder", "researcher"):
+        _make_bot_profile(home, name, managed=False)
+    if root_config:
+        (home / "config.yaml").write_text(
+            f"agent:\n  bot_mode:\n    enabled: true\n    roster:\n"
+            f"      - from: {source}\n        to: [researcher]\n", encoding="utf-8",
+        )
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    policy_path = managed / "config.yaml"
+    policy = (
+        "agent:\n  bot_mode:\n    enabled: true\n    roster:\n"
+        "      - from: ${TEST_BOT_FROM}\n        to: [\"${TEST_BOT_TARGET}\"]\n"
+    )
+    policy_path.write_text(policy, encoding="utf-8")
+    ambient = tmp_path / "unrelated-home"
+    monkeypatch.setenv("HERMES_HOME", str(ambient))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    monkeypatch.setenv("TEST_BOT_FROM", source)
+    monkeypatch.setenv("TEST_BOT_TARGET", "coder")
+    caller = home if source == "default" else home / "profiles" / source
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+
+    assert bot_mode_probe.is_bot_mode_managed(caller) is True
+    assert bot_mode_probe.allowed_local_profile_names(caller) == ["coder"]
+    monkeypatch.setenv("TEST_BOT_TARGET", "researcher")
+    assert bot_mode_probe.allowed_local_profile_names(caller) == ["researcher"]
+    assert not ambient.exists()
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+
+    policy_path.write_text("agent:\n  bot_mode:\n    enabled: false\n", encoding="utf-8")
+    assert bot_mode_probe.allowed_local_profile_names(caller) == []
+
+
+@pytest.mark.parametrize("scope", ["root", "managed"])
+@pytest.mark.parametrize("replacement", [
+    "", "null\n", "# interrupted write\n", "agent: [broken\n", "[]\n",
+    "agent: null\n", "agent:\n  bot_mode: null\n",
+    'agent:\n  bot_mode:\n    enabled: "true"\n', "unreadable", "dangling",
+])
+def test_live_policy_never_falls_back_after_invalid_edit(tmp_path, monkeypatch, scope, replacement):
+    import builtins
+
+    home = tmp_path / "install"
+    home.mkdir()
+    _make_bot_profile(home, "coder")
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    path = (home if scope == "root" else managed) / "config.yaml"
+    path.write_text("agent:\n  bot_mode:\n    enabled: true\n", encoding="utf-8")
+    assert bot_mode_probe.allowed_local_profile_names(home) == ["coder"]
+    if replacement == "unreadable":
+        original_open = builtins.open
+
+        def checked_open(file, *args, **kwargs):
+            if file == path:
+                raise PermissionError("policy unreadable")
+            return original_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", checked_open)
+    elif replacement == "dangling":
+        path.unlink()
+        try:
+            path.symlink_to(path.parent / "absent-policy")
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks unavailable")
+    else:
+        path.write_text(replacement, encoding="utf-8")
+    assert bot_mode_probe.allowed_local_profile_names(home) == []
+    assert bot_mode_probe.is_bot_mode_managed(home) is False
+
+
 def test_silent_when_soul_already_carries_protocol(tmp_path):
     """Legacy plugin-side append — never double the section."""
     home = tmp_path / ".hermes"
