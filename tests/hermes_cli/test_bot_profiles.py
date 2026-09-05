@@ -165,6 +165,27 @@ def test_read_profile_meta_explicit_flag_is_authoritative(bot_home):
     assert profiles_mod.read_profile_meta(on)["bot_enabled"] is True
 
 
+@pytest.mark.parametrize("value", ['"false"', '"true"', "1", "0", "null", "[]"])
+def test_bot_enabled_requires_a_boolean(bot_home, value):
+    profile_dir = _write_bot(bot_home, "invalid", profile_yaml=f"bot:\n  enabled: {value}\n")
+    assert profiles_mod.read_profile_meta(profile_dir)["bot_enabled"] is False
+
+
+def test_bot_gate_refuses_unreadable_metadata(bot_home, monkeypatch):
+    from hermes_cli.profile_bot_policy import read_bot_enabled
+
+    profile_dir = _write_bot(bot_home, "unreadable", profile_yaml="bot:\n  enabled: false\n")
+    original = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if path == profile_dir / "profile.yaml":
+            raise PermissionError("metadata is not readable")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    assert read_bot_enabled(profile_dir) is False
+
+
 def test_resolve_bot_chain_refuses_corrupt_metadata_profile(bot_home):
     """A previously disabled/indeterminate profile must not become callable
     because its metadata file cannot be parsed."""

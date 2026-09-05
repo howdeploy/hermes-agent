@@ -927,7 +927,7 @@ def test_gateway_redelivery_reclaims_expired_foreign_generation_and_recovers(
         == "admitted"
     )
     old_token = db.mark_bot_chain_delivery_running(
-        "session-1", "telegram-stale", lease_seconds=-1
+        "session-1", "telegram-stale"
     )
     assert old_token
     # The recording runtime is gone for good and unprobeable from here.
@@ -936,7 +936,7 @@ def test_gateway_redelivery_reclaims_expired_foreign_generation_and_recovers(
     with sqlite3.connect(db.db_path) as conn:
         conn.execute(
             "UPDATE bot_chain_deliveries SET owner_host = 'gone-host', "
-            "owner_pid = -1 WHERE session_id = 'session-1' AND "
+            "owner_pid = -1, lease_expires_at = 0 WHERE session_id = 'session-1' AND "
             "platform_message_id = 'telegram-stale'"
         )
     receipt = db.get_bot_chain_delivery("session-1", "telegram-stale")
@@ -1109,15 +1109,16 @@ def test_gateway_claim_loss_mid_turn_cancels_and_stands_down(
         session_id="session-1",
         session_key="telegram:chat-7:31",
     )
-    try:
-        response = asyncio.run(
+    async def exercise():
+        return await asyncio.wait_for(
             runner._handle_bot_chain_turn(
-                event,
-                session,
-                session.session_key,
-                parse_bot_chain_message(event.text),
-            )
+                event, session, session.session_key, parse_bot_chain_message(event.text)
+            ),
+            timeout=5,
         )
+
+    try:
+        response = asyncio.run(exercise())
 
         # The stale owner answered nothing and persisted nothing.
         assert response is None

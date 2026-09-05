@@ -48,6 +48,7 @@ Two durable mechanisms live here:
 
 import json
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -143,26 +144,18 @@ class SessionBotChainMixin:
 
         if not owner_host or owner_host != socket.gethostname():
             return True
-        if os.name == "nt":
-            try:
-                import ctypes
-
-                kernel32 = ctypes.windll.kernel32
-                # PROCESS_QUERY_LIMITED_INFORMATION
-                handle = kernel32.OpenProcess(0x1000, False, pid)
-                if not handle:
-                    return False
-                try:
-                    code = ctypes.c_ulong()
-                    if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                        return True
-                    return code.value == 259  # STILL_ACTIVE
-                finally:
-                    kernel32.CloseHandle(handle)
-            except Exception:
-                return True
         try:
-            os.kill(pid, 0)
+            import psutil
+
+            return psutil.pid_exists(pid)
+        except ImportError:
+            pass
+        except Exception:
+            return True
+        if os.name == "nt":
+            return True
+        try:
+            os.kill(pid, 0)  # windows-footgun: ok — nt returns above
         except ProcessLookupError:
             return False
         except PermissionError:
@@ -226,7 +219,7 @@ class SessionBotChainMixin:
                 # wedging the receipt forever.
                 lease_expires_at = row[3]
                 if lease_expires_at is None:
-                    lease_expires_at = (row[4] or now) + self.BOT_CHAIN_CLAIM_LEASE_SECONDS
+                    lease_expires_at = row[4] + self.BOT_CHAIN_CLAIM_LEASE_SECONDS
                 if lease_expires_at > now and self._owner_alive(row[1], row[2]):
                     return "running"
             # Resume/reclaim: reset to a fresh admission under the ORIGINAL
@@ -272,6 +265,8 @@ class SessionBotChainMixin:
             if lease_seconds is not None
             else self.BOT_CHAIN_CLAIM_LEASE_SECONDS
         )
+        if not math.isfinite(lease) or lease <= 0:
+            raise ValueError("bot-chain claim lease must be finite and positive")
 
         def _do(conn: sqlite3.Connection) -> bool:
             # Lease window opens only once the write transaction is held.
@@ -312,6 +307,8 @@ class SessionBotChainMixin:
             if lease_seconds is not None
             else self.BOT_CHAIN_CLAIM_LEASE_SECONDS
         )
+        if not math.isfinite(lease) or lease <= 0:
+            raise ValueError("bot-chain claim lease must be finite and positive")
 
         def _do(conn: sqlite3.Connection) -> bool:
             # Lease window opens only once the write transaction is held.
@@ -320,9 +317,9 @@ class SessionBotChainMixin:
                 "UPDATE bot_chain_deliveries SET lease_expires_at = ?, "
                 "updated_at = ? "
                 "WHERE session_id = ? AND platform_message_id = ? AND "
-                "state = 'running' AND owner_token = ?",
+                "state = 'running' AND owner_token = ? AND lease_expires_at > ?",
                 (now + lease, now, session_id, platform_message_id,
-                 str(owner_token)),
+                 str(owner_token), now),
             )
             return cursor.rowcount == 1
 
@@ -389,14 +386,15 @@ class SessionBotChainMixin:
             return False
 
         def _do(conn: sqlite3.Connection) -> bool:
+            now = time.time()
             cursor = conn.execute(
                 "UPDATE bot_chain_deliveries SET state = 'settled', "
                 "outcome = ?, detail = ?, lease_expires_at = NULL, "
                 "updated_at = ? "
                 "WHERE session_id = ? AND platform_message_id = ? AND "
-                "state = 'running' AND owner_token = ?",
-                (outcome, detail, time.time(), session_id,
-                 platform_message_id, str(owner_token)),
+                "state = 'running' AND owner_token = ? AND lease_expires_at > ?",
+                (outcome, detail, now, session_id,
+                 platform_message_id, str(owner_token), now),
             )
             return cursor.rowcount == 1
 

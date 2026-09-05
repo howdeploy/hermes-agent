@@ -658,7 +658,8 @@ def publish_bot_chain_history(
     without a duplicate write and makes the Bots row immediately resolvable by
     its exact-title registry key.
     """
-    from hermes_state import SessionDB, get_shared_session_db, release_or_close
+    from hermes_state import SessionDB
+    from hermes_state_registry import acquire, release_or_close
     from tools.bot_mode_probe import BOT_CHAT_TITLE
     from tools.bot_relay import acquire_turn_lock, turn_wait_seconds
 
@@ -672,7 +673,7 @@ def publish_bot_chain_history(
         if profile_home.parent.name == "profiles"
         else profile_home
     )
-    db = get_shared_session_db(profile_home / "state.db")
+    db = acquire(profile_home / "state.db")
     try:
         with acquire_turn_lock(root, profile.name):
             if control is not None and control.cancel_event.is_set():

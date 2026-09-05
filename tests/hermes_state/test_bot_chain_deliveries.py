@@ -248,9 +248,13 @@ finally:
             == "admitted"
         )
         old_token = db.mark_bot_chain_delivery_running(
-            "sess-chain", "tg-stale", lease_seconds=-1
+            "sess-chain", "tg-stale"
         )
         assert old_token
+        db._execute_write(lambda conn: conn.execute(
+            "UPDATE bot_chain_deliveries SET lease_expires_at = 0, "
+            "owner_host = 'previous-host' WHERE platform_message_id = 'tg-stale'"
+        ))
         row = db.get_bot_chain_delivery("sess-chain", "tg-stale")
         assert row["state"] == "running"
         assert row["lease_expires_at"] is not None
@@ -341,3 +345,40 @@ finally:
             db.admit_bot_chain_delivery("sess-chain", "tg-renew", "Bot Chain b")
             == "running"
         )
+
+    def test_expired_owner_cannot_renew_or_settle_before_reclaim(self, db):
+        db.admit_bot_chain_delivery("sess-chain", "expired", "Bot Chain old")
+        token = db.mark_bot_chain_delivery_running("sess-chain", "expired")
+        db._execute_write(lambda conn: conn.execute(
+            "UPDATE bot_chain_deliveries SET lease_expires_at = 0"
+        ))
+        assert not db.renew_bot_chain_delivery_claim("sess-chain", "expired", token)
+        assert not db.settle_bot_chain_delivery(
+            "sess-chain", "expired", owner_token=token, outcome="completed"
+        )
+        assert db.get_bot_chain_delivery("sess-chain", "expired")["state"] == "running"
+
+    def test_legacy_zero_timestamp_does_not_renew_itself_on_read(self, db):
+        db.admit_bot_chain_delivery("sess-chain", "legacy", "Bot Chain old")
+        db.mark_bot_chain_delivery_running("sess-chain", "legacy")
+        db._execute_write(lambda conn: conn.execute(
+            "UPDATE bot_chain_deliveries SET lease_expires_at = NULL, "
+            "owner_token = NULL, owner_host = 'previous-host', updated_at = 0"
+        ))
+        assert db.admit_bot_chain_delivery(
+            "sess-chain", "legacy", "Bot Chain replacement"
+        ) == "admitted"
+        assert db.get_bot_chain_delivery("sess-chain", "legacy")["chain_name"] == "Bot Chain old"
+
+    @pytest.mark.parametrize("duration", [0, -1, float("inf"), float("nan")])
+    def test_claim_rejects_invalid_lease_duration(self, db, duration):
+        db.admit_bot_chain_delivery("sess-chain", "duration", "Bot Chain duration")
+        with pytest.raises(ValueError, match="finite and positive"):
+            db.mark_bot_chain_delivery_running(
+                "sess-chain", "duration", lease_seconds=duration
+            )
+        token = db.mark_bot_chain_delivery_running("sess-chain", "duration")
+        with pytest.raises(ValueError, match="finite and positive"):
+            db.renew_bot_chain_delivery_claim(
+                "sess-chain", "duration", token, lease_seconds=duration
+            )
